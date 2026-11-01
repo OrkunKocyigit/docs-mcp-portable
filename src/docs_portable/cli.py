@@ -17,6 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="install anything missing, then start everything (default)")
     sub.add_parser("setup", help="only download/install dependencies and the model")
     sub.add_parser("embedding-server", help="run just the OpenAI-compatible embedding server")
+    sub.add_parser("rerank-server", help="run just the /v1/rerank server")
     cli = sub.add_parser("cli", help="run the docs-mcp-server CLI (scrape, search, list, ...) with this setup")
     cli.add_argument("cli_args", nargs=argparse.REMAINDER, help="arguments passed to docs-mcp-server")
     args = parser.parse_args(argv)
@@ -37,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
         from .embedding_server import main as serve
 
         serve()
+        return 0
+    if command == "rerank-server":
+        from .rerank_server import main as serve_rerank
+
+        serve_rerank()
         return 0
 
     from .launcher import run, run_cli

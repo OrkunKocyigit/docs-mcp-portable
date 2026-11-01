@@ -13,15 +13,17 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import paths
+from . import docs_mcp_patch, paths
 from .config import Config
 
 USER_AGENT = "docs-portable/0.1 (+https://github.com/arabold/docs-mcp-server)"
 MODEL_PATTERNS = ["onnx/*", "README.md"]
+JINA_PATTERNS = ["*.json", "*.txt", "modeling.py", "model.safetensors", "README.md"]
 
 
 def say(message: str) -> None:
@@ -198,6 +200,69 @@ def ensure_model(cfg: Config) -> Path:
     return target
 
 
+def _snapshot(repo: str, revision: str, patterns: list[str], label: str) -> None:
+    target = paths.model_dir(repo)
+    marker = target / ".complete"
+    stamp = f"{revision}\n" + "\n".join(patterns)
+    if marker.exists() and marker.read_text() == stamp:
+        return
+    say(f"Downloading {label} (resumable)")
+    os.environ.setdefault("HF_HOME", str(paths.CACHE_DIR / "hf"))
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    from huggingface_hub import snapshot_download
+
+    target.mkdir(parents=True, exist_ok=True)
+    snapshot_download(repo_id=repo, revision=revision, local_dir=target, allow_patterns=patterns)
+    marker.write_text(stamp)
+
+
+def _jina_requirements() -> list[str]:
+    with (paths.ROOT / "pyproject.toml").open("rb") as fh:
+        return tomllib.load(fh)["project"]["optional-dependencies"]["jina"]
+
+
+def ensure_jina_dependencies() -> None:
+    if sys.platform == "win32" and platform.machine().upper() != "AMD64":
+        raise RuntimeError("The jina reranker needs PyTorch, which has no Windows ARM64 wheel; use backend = \"bge\".")
+    deps = _jina_requirements()
+    marker = Path(sys.executable).resolve().parent / ".deps-jina"
+    digest = hashlib.sha256("\n".join(sorted(deps)).encode()).hexdigest()
+    if marker.exists() and marker.read_text() == digest:
+        return
+    say("Installing jina reranker dependencies: " + ", ".join(deps))
+    env = os.environ.copy()
+    env["PIP_CACHE_DIR"] = str(paths.CACHE_DIR / "pip")
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    _run(
+        [sys.executable, "-m", "pip", "install", "--no-warn-script-location", "--only-binary=:all:", *deps],
+        env,
+        "pip install (jina reranker)",
+    )
+    marker.write_text(digest)
+
+
+def ensure_rerank(cfg: Config) -> None:
+    rr = cfg.rerank
+    if not rr.enabled:
+        return
+    if rr.backend == "bge":
+        _snapshot(rr.bge_repo, rr.bge_revision, [rr.bge_onnx_file, "tokenizer.json", "config.json", "README.md"],
+                  f"{rr.bge_repo} ({rr.bge_onnx_file})")
+    else:
+        ensure_jina_dependencies()
+        _snapshot(rr.jina_repo, rr.jina_revision, JINA_PATTERNS, f"{rr.jina_repo} (about 1.2 GB, CC BY-NC 4.0)")
+
+    try:
+        changed = docs_mcp_patch.apply(_package_dir(cfg), _installed_version(cfg))
+    except docs_mcp_patch.PatchError as exc:
+        raise RuntimeError(
+            f"Cannot add reranking to docs-mcp-server: {exc}. Pin [docs_mcp] version to a supported release "
+            "or set [rerank] enabled = false."
+        ) from exc
+    if changed:
+        say("Added the rerank stage to docs-mcp-server search")
+
+
 def ensure_all(cfg: Config) -> None:
     for d in (paths.RUNTIME, paths.CACHE_DIR, paths.DATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -205,4 +270,5 @@ def ensure_all(cfg: Config) -> None:
     ensure_docs_mcp(cfg)
     ensure_browser(cfg)
     ensure_model(cfg)
+    ensure_rerank(cfg)
     say("Everything is installed.")

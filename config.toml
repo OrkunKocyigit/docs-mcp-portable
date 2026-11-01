@@ -21,6 +21,34 @@ providers = ["CPUExecutionProvider"]
 # Log every /v1/embeddings request.
 access_log = false
 
+[rerank]
+# Re-scores the top hybrid-search candidates with a cross-encoder/listwise reranker before
+# docs-mcp-server picks its results (patches docs-mcp-server, see README).
+enabled = true
+# "bge"  = BAAI/bge-reranker-v2-m3 (Apache-2.0), onnxruntime, no extra Python packages.
+# "jina" = jinaai/jina-reranker-v3.5 (CC BY-NC 4.0 - NON-COMMERCIAL USE ONLY). Installs
+#          torch + transformers (~1 GB, Windows x64 only) on the next start.
+backend = "bge"
+# Required for backend = "jina": confirms this installation is for non-commercial use.
+accept_noncommercial_license = false
+host = "127.0.0.1"
+port = 8082
+# Hybrid candidates re-scored per search. More = better recall of the reranker, slower search.
+# docs-mcp-server only fetches limit * DOCS_MCP_SEARCH_OVERFETCH_FACTOR full-text candidates
+# (5 * 2 = 10 by default); raise that factor in [docs_mcp.env] to give the reranker more to work with.
+candidates = 30
+# If a rerank call takes longer, docs-mcp-server keeps its hybrid order for that search.
+timeout_ms = 30000
+# bge ONNX variant: onnx/model_int8.onnx (570 MB, fastest on CPU), onnx/model_fp16.onnx, onnx/model.onnx (fp32).
+bge_onnx_file = "onnx/model_int8.onnx"
+# Tokens per (query, chunk) pair; docs-mcp-server chunks are up to ~1300 tokens.
+bge_max_length = 1024
+# Pairs per ONNX forward pass (bge) and CPU threads (0 = default).
+batch_size = 8
+threads = 0
+providers = ["CPUExecutionProvider"]
+access_log = false
+
 [docs_mcp]
 package = "@arabold/docs-mcp-server"
 # Pinned npm version. Use "latest" to always take the newest release.

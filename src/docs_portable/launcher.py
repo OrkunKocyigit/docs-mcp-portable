@@ -17,6 +17,12 @@ from . import installer, paths
 from .config import Config
 
 HEALTH_TIMEOUT_S = 300
+RERANK_ENV = (
+    "DOCS_PORTABLE_RERANK_URL",
+    "DOCS_PORTABLE_RERANK_MODEL",
+    "DOCS_PORTABLE_RERANK_CANDIDATES",
+    "DOCS_PORTABLE_RERANK_TIMEOUT_MS",
+)
 
 
 def _kill_children_with_launcher() -> None:
@@ -75,11 +81,11 @@ def _port_free(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) != 0
 
 
-def _wait_healthy(url: str, proc: subprocess.Popen) -> None:
+def _wait_healthy(url: str, proc: subprocess.Popen, name: str = "Embedding server") -> None:
     deadline = time.monotonic() + HEALTH_TIMEOUT_S
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"Embedding server exited early (code {proc.returncode})")
+            raise RuntimeError(f"{name} exited early (code {proc.returncode})")
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
@@ -87,7 +93,7 @@ def _wait_healthy(url: str, proc: subprocess.Popen) -> None:
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(0.5)
-    raise RuntimeError("Timed out waiting for the embedding server")
+    raise RuntimeError(f"Timed out waiting for the {name.lower()}")
 
 
 def _stop(proc: subprocess.Popen | None) -> None:
@@ -109,6 +115,25 @@ def _smoke_test(cfg: Config) -> None:
     with urllib.request.urlopen(req, timeout=120) as r:
         dim = len(json.load(r)["data"][0]["embedding"])
     print(f"[run] Embedding endpoint ready: {cfg.embedding.base_url} ({cfg.embedding.model_name}, {dim} dims)", flush=True)
+
+
+def _smoke_test_rerank(cfg: Config) -> None:
+    rr = cfg.rerank
+    body = json.dumps({"query": "ping", "documents": ["ping", "pong"]}).encode()
+    req = urllib.request.Request(rr.url, body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        results = json.load(r)["results"]
+    if len(results) != 2:
+        raise RuntimeError("Rerank endpoint returned an unexpected response")
+    print(f"[run] Rerank endpoint ready: {rr.url} ({rr.model_name}, top {rr.candidates} candidates)", flush=True)
+
+
+def _model_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["HF_HOME"] = str(paths.CACHE_DIR / "hf")
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    return env
 
 
 def docs_mcp_env(cfg: Config) -> dict[str, str]:
@@ -133,6 +158,17 @@ def docs_mcp_env(cfg: Config) -> dict[str, str]:
             "DOCS_MCP_TELEMETRY": "true" if cfg.docs_mcp.telemetry else "false",
         }
     )
+    for key in RERANK_ENV:
+        env.pop(key, None)
+    if cfg.rerank.enabled:
+        env.update(
+            {
+                "DOCS_PORTABLE_RERANK_URL": cfg.rerank.url,
+                "DOCS_PORTABLE_RERANK_MODEL": cfg.rerank.model_name,
+                "DOCS_PORTABLE_RERANK_CANDIDATES": str(cfg.rerank.candidates),
+                "DOCS_PORTABLE_RERANK_TIMEOUT_MS": str(cfg.rerank.timeout_ms),
+            }
+        )
     env.update(cfg.docs_mcp.env)
     return env
 
@@ -150,6 +186,8 @@ def run_cli(cfg: Config, args: list[str]) -> int:
             "Start start.bat in another window first.",
             file=sys.stderr,
         )
+    elif cfg.rerank.enabled and _port_free(cfg.rerank.host, cfg.rerank.port):
+        print("[cli] The rerank server is not running; search falls back to hybrid ranking.", file=sys.stderr)
     return subprocess.call(cmd, env=docs_mcp_env(cfg))
 
 
@@ -157,23 +195,29 @@ def run(cfg: Config) -> int:
     installer.ensure_all(cfg)
     _kill_children_with_launcher()
 
-    emb, docs = cfg.embedding, cfg.docs_mcp
-    for name, host, port in (("embedding", emb.host, emb.port), ("docs-mcp-server", docs.host, docs.port)):
+    emb, rr, docs = cfg.embedding, cfg.rerank, cfg.docs_mcp
+    ports = [("embedding", emb.host, emb.port), ("docs-mcp-server", docs.host, docs.port)]
+    if rr.enabled:
+        ports.append(("rerank", rr.host, rr.port))
+    for name, host, port in ports:
         if not _port_free(host, port):
             print(f"[run] Port {port} ({name}) is already in use. Change it in config.toml.", file=sys.stderr)
             return 1
 
-    embed_env = os.environ.copy()
-    embed_env["HF_HOME"] = str(paths.CACHE_DIR / "hf")
-    embed_env["HF_HUB_OFFLINE"] = "1"
-
     embed: subprocess.Popen | None = None
+    rerank: subprocess.Popen | None = None
     server: subprocess.Popen | None = None
     try:
         print("[run] Starting embedding server...", flush=True)
-        embed = subprocess.Popen([sys.executable, "-m", "docs_portable.embedding_server"], env=embed_env)
+        embed = subprocess.Popen([sys.executable, "-m", "docs_portable.embedding_server"], env=_model_env())
+        if rr.enabled:
+            print(f"[run] Starting rerank server ({rr.model_name})...", flush=True)
+            rerank = subprocess.Popen([sys.executable, "-m", "docs_portable.rerank_server"], env=_model_env())
         _wait_healthy(f"http://{emb.host}:{emb.port}/health", embed)
         _smoke_test(cfg)
+        if rerank is not None:
+            _wait_healthy(f"http://{rr.host}:{rr.port}/health", rerank, "Rerank server")
+            _smoke_test_rerank(cfg)
 
         cmd = [
             str(paths.NODE_EXE),
@@ -190,8 +234,8 @@ def run(cfg: Config) -> int:
         server = subprocess.Popen(cmd, env=docs_mcp_env(cfg))
 
         while True:
-            for proc, name in ((embed, "embedding server"), (server, "docs-mcp-server")):
-                if proc.poll() is not None:
+            for proc, name in ((embed, "embedding server"), (rerank, "rerank server"), (server, "docs-mcp-server")):
+                if proc is not None and proc.poll() is not None:
                     print(f"[run] {name} exited with code {proc.returncode}; shutting down.", flush=True)
                     return proc.returncode or 1
             time.sleep(0.5)
@@ -203,4 +247,5 @@ def run(cfg: Config) -> int:
         return 1
     finally:
         _stop(server)
+        _stop(rerank)
         _stop(embed)

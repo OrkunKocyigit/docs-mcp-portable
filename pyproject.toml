@@ -14,3 +14,10 @@ dependencies = [
     "numpy>=1.26",
     "huggingface_hub>=0.26",
 ]
+
+[project.optional-dependencies]
+# Only installed when config.toml selects [rerank] backend = "jina" (jina-reranker-v3.5, non-commercial).
+jina = [
+    "torch==2.15.0",
+    "transformers==5.22.1",
+]
