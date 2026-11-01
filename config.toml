@@ -1,0 +1,44 @@
+# docs-portable configuration. Edit freely; changes apply on the next start.
+
+[embedding]
+# Hugging Face repo that is downloaded on first run (its ONNX export is used).
+model_repo = "BAAI/bge-m3"
+# Model name exposed by the OpenAI-compatible endpoint and given to docs-mcp-server.
+# NOTE: changing the model (or its dimension) makes docs-mcp-server drop stored vectors.
+model_name = "bge-m3"
+host = "127.0.0.1"
+port = 8081
+# Truncation limit in tokens (bge-m3 supports up to 8192).
+max_length = 8192
+# Texts per ONNX forward pass.
+batch_size = 8
+# CPU threads for inference, 0 = onnxruntime default.
+threads = 0
+# onnxruntime execution providers, in order of preference.
+# GPU users: swap `onnxruntime` for `onnxruntime-directml` in pyproject.toml,
+# then use ["DmlExecutionProvider", "CPUExecutionProvider"].
+providers = ["CPUExecutionProvider"]
+# Log every /v1/embeddings request.
+access_log = false
+
+[docs_mcp]
+package = "@arabold/docs-mcp-server"
+# Pinned npm version. Use "latest" to always take the newest release.
+version = "3.4.1"
+host = "127.0.0.1"
+port = 6280
+# Usage telemetry of docs-mcp-server (off by default for a self-contained setup).
+telemetry = false
+# Download Playwright's Chromium on first run (needed to scrape JavaScript-rendered sites).
+install_browser = true
+# Extra command-line flags for docs-mcp-server, e.g. ["--read-only"].
+extra_args = []
+
+# Extra environment variables passed to docs-mcp-server, e.g. a GitHub token:
+# [docs_mcp.env]
+# GITHUB_TOKEN = "ghp_..."
+[docs_mcp.env]
+
+[node]
+# Portable Node.js (docs-mcp-server needs >= 22).
+version = "24.22.2"

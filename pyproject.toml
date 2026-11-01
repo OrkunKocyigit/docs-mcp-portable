@@ -1,0 +1,16 @@
+[project]
+name = "docs-portable"
+version = "0.1.0"
+description = "Portable launcher: docs-mcp-server + a local BGE-M3 OpenAI-compatible embedding endpoint."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+# Installed by bootstrap.py into the private runtime\python (single source of truth).
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "onnxruntime>=1.20",
+    "tokenizers>=0.20",
+    "numpy>=1.26",
+    "huggingface_hub>=0.26",
+]
