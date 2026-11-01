@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import paths
-from .config import RerankConfig, load_config
+from .config import GpuConfig, RerankConfig, load_config
 
 log = logging.getLogger("rerank")
 
@@ -29,38 +29,35 @@ MAX_DOCUMENT_CHARS = 100_000
 
 
 class Scorer(Protocol):
+    device: str
+
     def score(self, query: str, documents: list[str]) -> list[float]: ...
 
 
 class BgeReranker:
     """Cross-encoder: one (query, passage) pair per row, sigmoid of the relevance logit."""
 
-    def __init__(self, cfg: RerankConfig) -> None:
-        import onnxruntime as ort
+    def __init__(self, cfg: RerankConfig, gpu: GpuConfig) -> None:
         from tokenizers import Tokenizer
 
+        from .onnx_session import create_session, device_name, run_options
+
         model_dir = paths.model_dir(cfg.bge_repo)
-        onnx_path = model_dir / cfg.bge_onnx_file
+        onnx_path = model_dir / cfg.bge_file(gpu)
         if not onnx_path.exists():
             raise SystemExit(f"Reranker model not found at {onnx_path}. Run the launcher once to download it.")
 
+        self.session = create_session(onnx_path, gpu, cfg.threads, "rerank")
+        self.device = device_name(self.session)
+        self._run_options = run_options(gpu)
+
         self.batch_size = cfg.batch_size
+        self.max_length = cfg.limits(self.device).bge_max_length
         self.tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.tokenizer.no_padding()
-        self.tokenizer.enable_truncation(max_length=cfg.bge_max_length)
+        self.tokenizer.enable_truncation(max_length=self.max_length)
         self.pad_id = self.tokenizer.token_to_id("<pad>") or 1
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if cfg.threads > 0:
-            options.intra_op_num_threads = cfg.threads
-        available = ort.get_available_providers()
-        providers = [p for p in cfg.providers if p in available] or ["CPUExecutionProvider"]
-
-        started = time.perf_counter()
-        self.session = ort.InferenceSession(str(onnx_path), options, providers=providers)
-        log.info("Loaded %s (%s) with %s in %.1fs", cfg.bge_repo, cfg.bge_onnx_file, self.session.get_providers(),
-                 time.perf_counter() - started)
+        log.info("Truncating (query, chunk) pairs to %d tokens on %s", self.max_length, self.device)
         self._inputs = {i.name for i in self.session.get_inputs()}
         self._output = self.session.get_outputs()[0].name
 
@@ -81,7 +78,7 @@ class BgeReranker:
                 mask[row, :n] = 1
             feeds = {"input_ids": ids, "attention_mask": mask, "token_type_ids": np.zeros_like(ids)}
             feeds = {k: v for k, v in feeds.items() if k in self._inputs}
-            (out,) = self.session.run([self._output], feeds)
+            (out,) = self.session.run([self._output], feeds, self._run_options)
             logits[idx] = np.asarray(out, dtype=np.float32).reshape(len(idx), -1)[:, 0]
 
         return (1.0 / (1.0 + np.exp(-logits))).tolist()
@@ -90,7 +87,7 @@ class BgeReranker:
 class JinaReranker:
     """Listwise reranker; scores are cosine similarities in [-1, 1]."""
 
-    def __init__(self, cfg: RerankConfig) -> None:
+    def __init__(self, cfg: RerankConfig, gpu: GpuConfig) -> None:
         try:
             import torch
             from transformers import AutoModel
@@ -103,13 +100,28 @@ class JinaReranker:
         if cfg.threads > 0:
             torch.set_num_threads(cfg.threads)
 
+        device = "cpu"
+        if gpu.provider == "cuda":
+            if torch.cuda.is_available() and gpu.device_id < torch.cuda.device_count():
+                device = f"cuda:{gpu.device_id}"
+            else:
+                log.warning("[gpu] provider = \"cuda\" but PyTorch sees no usable CUDA device %d; running jina on "
+                            "the CPU. Run `start.bat setup` to install the CUDA build of torch.", gpu.device_id)
+        elif gpu.provider == "directml":
+            log.info("jina-reranker runs on the CPU; [gpu] provider = \"directml\" only accelerates ONNX models.")
+        self.device = "cuda" if device != "cpu" else "cpu"
+
         started = time.perf_counter()
         # trust_remote_code runs modeling.py from the local snapshot pinned to cfg.jina_revision.
         self.model = AutoModel.from_pretrained(
-            str(model_dir), dtype=torch.float32, trust_remote_code=True, local_files_only=True
-        )
+            str(model_dir),
+            dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
+            trust_remote_code=True,
+            local_files_only=True,
+        ).to(device)
         self.model.eval()
-        log.info("Loaded %s@%s in %.1fs", cfg.jina_repo, cfg.jina_revision[:7], time.perf_counter() - started)
+        log.info("Loaded %s@%s on %s in %.1fs", cfg.jina_repo, cfg.jina_revision[:7], device,
+                 time.perf_counter() - started)
 
     def score(self, query: str, documents: list[str]) -> list[float]:
         scores = [0.0] * len(documents)
@@ -118,8 +130,8 @@ class JinaReranker:
         return scores
 
 
-def load_scorer(cfg: RerankConfig) -> Scorer:
-    return BgeReranker(cfg) if cfg.backend == "bge" else JinaReranker(cfg)
+def load_scorer(cfg: RerankConfig, gpu: GpuConfig) -> Scorer:
+    return BgeReranker(cfg, gpu) if cfg.backend == "bge" else JinaReranker(cfg, gpu)
 
 
 Document = Annotated[str, Field(max_length=MAX_DOCUMENT_CHARS)]
@@ -148,20 +160,20 @@ def rank(scorer: Scorer, req: RerankRequest, model_name: str) -> dict:
     return {"model": model_name, "results": results}
 
 
-def create_app(cfg: RerankConfig, scorer_factory=load_scorer) -> FastAPI:
+def create_app(cfg: RerankConfig, gpu: GpuConfig, scorer_factory=load_scorer) -> FastAPI:
     state: dict[str, Scorer] = {}
     lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        state["scorer"] = scorer_factory(cfg)
+        state["scorer"] = scorer_factory(cfg, gpu)
         yield
 
     app = FastAPI(title="docs-portable reranker", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "model": cfg.model_name}
+        return {"status": "ok", "model": cfg.model_name, "device": state["scorer"].device}
 
     @app.post("/v1/rerank")
     def rerank(req: RerankRequest) -> dict:
@@ -172,9 +184,10 @@ def create_app(cfg: RerankConfig, scorer_factory=load_scorer) -> FastAPI:
 
 
 def main() -> None:
-    cfg = load_config().rerank
+    full = load_config()
+    cfg = full.rerank
     logging.basicConfig(level=logging.INFO, format="[rerank] %(message)s")
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info", access_log=cfg.access_log)
+    uvicorn.run(create_app(cfg, full.gpu), host=cfg.host, port=cfg.port, log_level="info", access_log=cfg.access_log)
 
 
 if __name__ == "__main__":

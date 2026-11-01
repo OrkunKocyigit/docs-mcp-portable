@@ -5,26 +5,24 @@ from __future__ import annotations
 import base64
 import logging
 import threading
-import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
 import numpy as np
-import onnxruntime as ort
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
 from . import paths
-from .config import EmbeddingConfig, load_config
+from .config import EmbeddingConfig, GpuConfig, load_config
+from .onnx_session import create_session, device_name, run_options
 
-log = logging.getLogger("embedding")
 HIDDEN_SIZE = 1024
 
 
 class Embedder:
-    def __init__(self, cfg: EmbeddingConfig) -> None:
+    def __init__(self, cfg: EmbeddingConfig, gpu: GpuConfig) -> None:
         onnx_dir = paths.model_dir(cfg.model_repo) / "onnx"
         if not (onnx_dir / "model.onnx").exists():
             raise SystemExit(f"Model not found in {onnx_dir}. Run the launcher once to download it.")
@@ -35,16 +33,9 @@ class Embedder:
         self.tokenizer.enable_truncation(max_length=cfg.max_length)
         self.pad_id = self.tokenizer.token_to_id("<pad>") or 1
 
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if cfg.threads > 0:
-            options.intra_op_num_threads = cfg.threads
-        available = ort.get_available_providers()
-        providers = [p for p in cfg.providers if p in available] or ["CPUExecutionProvider"]
-
-        started = time.perf_counter()
-        self.session = ort.InferenceSession(str(onnx_dir / "model.onnx"), options, providers=providers)
-        log.info("Loaded %s with %s in %.1fs", cfg.model_repo, self.session.get_providers(), time.perf_counter() - started)
+        self.session = create_session(onnx_dir / "model.onnx", gpu, cfg.threads, "embedding")
+        self.device = device_name(self.session)
+        self._run_options = run_options(gpu)
         self._inputs = {i.name for i in self.session.get_inputs()}
         self._lock = threading.Lock()
 
@@ -66,7 +57,7 @@ class Embedder:
                     mask[row, :n] = 1
                 feeds = {"input_ids": ids, "attention_mask": mask}
                 feeds = {k: v for k, v in feeds.items() if k in self._inputs}
-                (pooled,) = self.session.run(["sentence_embedding"], feeds)
+                (pooled,) = self.session.run(["sentence_embedding"], feeds, self._run_options)
                 result[idx] = pooled
 
         norms = np.linalg.norm(result, axis=1, keepdims=True)
@@ -82,19 +73,19 @@ class EmbeddingRequest(BaseModel):
     user: str | None = None
 
 
-def create_app(cfg: EmbeddingConfig) -> FastAPI:
+def create_app(cfg: EmbeddingConfig, gpu: GpuConfig) -> FastAPI:
     state: dict[str, Embedder] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        state["embedder"] = Embedder(cfg)
+        state["embedder"] = Embedder(cfg, gpu)
         yield
 
     app = FastAPI(title="docs-portable embeddings", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "model": cfg.model_name}
+        return {"status": "ok", "model": cfg.model_name, "device": state["embedder"].device}
 
     @app.get("/v1/models")
     def models() -> dict:
@@ -125,10 +116,11 @@ def create_app(cfg: EmbeddingConfig) -> FastAPI:
 
 
 def main() -> None:
-    cfg = load_config().embedding
+    full = load_config()
+    cfg = full.embedding
     logging.basicConfig(level=logging.INFO, format="[embed] %(message)s")
     uvicorn.run(
-        create_app(cfg),
+        create_app(cfg, full.gpu),
         host=cfg.host,
         port=cfg.port,
         log_level="info",

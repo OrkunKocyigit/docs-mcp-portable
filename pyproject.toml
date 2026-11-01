@@ -16,8 +16,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Chosen by bootstrap.py from config.toml [gpu] provider; each replaces "onnxruntime" above
+# (they ship the same Python module and cannot be installed side by side).
+# CUDA 13 + cuDNN 9 runtime DLLs come from nvidia-* wheels, so no system CUDA install is needed.
+cuda = ["onnxruntime-gpu[cuda,cudnn]==1.31.1"]
+directml = ["onnxruntime-directml==1.24.4"]
 # Only installed when config.toml selects [rerank] backend = "jina" (jina-reranker-v3.5, non-commercial).
 jina = [
     "torch==2.15.0",
+    "transformers==5.22.1",
+]
+# jina with [gpu] provider = "cuda": PyTorch's CUDA 13.0 build, pinned by URL and sha256 (not on PyPI).
+jina-cuda = [
+    "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
     "transformers==5.22.1",
 ]

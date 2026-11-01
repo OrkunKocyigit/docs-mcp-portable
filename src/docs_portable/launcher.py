@@ -114,10 +114,17 @@ def _smoke_test(cfg: Config) -> None:
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         dim = len(json.load(r)["data"][0]["embedding"])
-    print(f"[run] Embedding endpoint ready: {cfg.embedding.base_url} ({cfg.embedding.model_name}, {dim} dims)", flush=True)
+    device = _device(f"http://{cfg.embedding.host}:{cfg.embedding.port}/health")
+    print(f"[run] Embedding endpoint ready: {cfg.embedding.base_url} ({cfg.embedding.model_name}, {dim} dims, {device})",
+          flush=True)
 
 
-def _smoke_test_rerank(cfg: Config) -> None:
+def _device(health_url: str) -> str:
+    with urllib.request.urlopen(health_url, timeout=10) as r:
+        return str(json.load(r).get("device", "cpu"))
+
+
+def _smoke_test_rerank(cfg: Config) -> str:
     rr = cfg.rerank
     body = json.dumps({"query": "ping", "documents": ["ping", "pong"]}).encode()
     req = urllib.request.Request(rr.url, body, {"Content-Type": "application/json"})
@@ -125,7 +132,22 @@ def _smoke_test_rerank(cfg: Config) -> None:
         results = json.load(r)["results"]
     if len(results) != 2:
         raise RuntimeError("Rerank endpoint returned an unexpected response")
-    print(f"[run] Rerank endpoint ready: {rr.url} ({rr.model_name}, top {rr.candidates} candidates)", flush=True)
+    device = _device(f"http://{rr.host}:{rr.port}/health")
+    limits = rr.limits(device)
+    print(f"[run] Rerank endpoint ready: {rr.url} ({rr.model_name}, {device}: top {limits.candidates} candidates, "
+          f"timeout {limits.timeout_ms} ms)", flush=True)
+    return device
+
+
+def _rerank_device(cfg: Config) -> str:
+    """Device of a running rerank server, else the one config.toml asks for."""
+    rr = cfg.rerank
+    if not _port_free(rr.host, rr.port):
+        try:
+            return _device(f"http://{rr.host}:{rr.port}/health")
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    return "cpu" if not cfg.gpu.enabled else cfg.gpu.provider
 
 
 def _model_env() -> dict[str, str]:
@@ -136,7 +158,7 @@ def _model_env() -> dict[str, str]:
     return env
 
 
-def docs_mcp_env(cfg: Config) -> dict[str, str]:
+def docs_mcp_env(cfg: Config, rerank_device: str | None = None) -> dict[str, str]:
     for d in (paths.STORE_DIR, paths.APPDATA_DIR, paths.LOCALAPPDATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
     emb = cfg.embedding
@@ -161,12 +183,13 @@ def docs_mcp_env(cfg: Config) -> dict[str, str]:
     for key in RERANK_ENV:
         env.pop(key, None)
     if cfg.rerank.enabled:
+        limits = cfg.rerank.limits(rerank_device or _rerank_device(cfg))
         env.update(
             {
                 "DOCS_PORTABLE_RERANK_URL": cfg.rerank.url,
                 "DOCS_PORTABLE_RERANK_MODEL": cfg.rerank.model_name,
-                "DOCS_PORTABLE_RERANK_CANDIDATES": str(cfg.rerank.candidates),
-                "DOCS_PORTABLE_RERANK_TIMEOUT_MS": str(cfg.rerank.timeout_ms),
+                "DOCS_PORTABLE_RERANK_CANDIDATES": str(limits.candidates),
+                "DOCS_PORTABLE_RERANK_TIMEOUT_MS": str(limits.timeout_ms),
             }
         )
     env.update(cfg.docs_mcp.env)
@@ -215,9 +238,10 @@ def run(cfg: Config) -> int:
             rerank = subprocess.Popen([sys.executable, "-m", "docs_portable.rerank_server"], env=_model_env())
         _wait_healthy(f"http://{emb.host}:{emb.port}/health", embed)
         _smoke_test(cfg)
+        rerank_device = None
         if rerank is not None:
             _wait_healthy(f"http://{rr.host}:{rr.port}/health", rerank, "Rerank server")
-            _smoke_test_rerank(cfg)
+            rerank_device = _smoke_test_rerank(cfg)
 
         cmd = [
             str(paths.NODE_EXE),
@@ -231,7 +255,7 @@ def run(cfg: Config) -> int:
             *docs.extra_args,
         ]
         print(f"[run] Starting docs-mcp-server -> http://{docs.host}:{docs.port}  (MCP: /mcp)", flush=True)
-        server = subprocess.Popen(cmd, env=docs_mcp_env(cfg))
+        server = subprocess.Popen(cmd, env=docs_mcp_env(cfg, rerank_device))
 
         while True:
             for proc, name in ((embed, "embedding server"), (rerank, "rerank server"), (server, "docs-mcp-server")):

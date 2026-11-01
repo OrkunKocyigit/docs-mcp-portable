@@ -12,11 +12,13 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from docs_portable import paths
-from docs_portable.config import RerankConfig
+from docs_portable.config import GpuConfig, RerankConfig
 from docs_portable.rerank_server import MAX_DOCUMENTS, RerankRequest, create_app, rank
 
 
 class KeywordScorer:
+    device = "cpu"
+
     def score(self, query, documents):
         words = query.lower().split()
         return [float(sum(word in doc.lower() for word in words)) for doc in documents]
@@ -82,7 +84,7 @@ class HttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cfg = RerankConfig(port=_free_port())
-        app = create_app(cfg, scorer_factory=lambda _: KeywordScorer())
+        app = create_app(cfg, GpuConfig(), scorer_factory=lambda _cfg, _gpu: KeywordScorer())
         cls.server = uvicorn.Server(uvicorn.Config(app, host=cfg.host, port=cfg.port, log_level="error"))
         cls.thread = threading.Thread(target=cls.server.run, daemon=True)
         cls.thread.start()
@@ -108,7 +110,7 @@ class HttpTest(unittest.TestCase):
 
     def test_health(self):
         with urllib.request.urlopen(f"{self.base}/health", timeout=10) as r:
-            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-reranker-v2-m3"})
+            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-reranker-v2-m3", "device": "cpu"})
 
     def test_rerank(self):
         status, body = self.post(json.dumps({"query": "tea", "documents": ["a", "tea"], "top_n": 1}).encode())
@@ -123,14 +125,16 @@ class HttpTest(unittest.TestCase):
 
 
 BGE_DIR = paths.model_dir(RerankConfig().bge_repo)
+CPU = GpuConfig()
 
 
-@unittest.skipUnless((BGE_DIR / RerankConfig().bge_onnx_file).exists(), "bge-reranker-v2-m3 not downloaded")
+@unittest.skipUnless((BGE_DIR / RerankConfig().bge_file(CPU)).exists(), "bge-reranker-v2-m3 not downloaded")
 class BgeModelTest(unittest.TestCase):
     def test_relevant_passage_ranks_first(self):
         from docs_portable.rerank_server import BgeReranker
 
-        scorer = BgeReranker(RerankConfig())
+        scorer = BgeReranker(RerankConfig(), CPU)
+        self.assertEqual(scorer.device, "cpu")
         docs = [
             "Basketball is one of the most popular sports in the United States.",
             "useEffect cleanup: return a function from the effect to unsubscribe before the next run or unmount.",

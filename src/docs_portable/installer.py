@@ -19,7 +19,7 @@ import zipfile
 from pathlib import Path
 
 from . import docs_mcp_patch, paths
-from .config import Config
+from .config import Config, GpuConfig
 
 USER_AGENT = "docs-portable/0.1 (+https://github.com/arabold/docs-mcp-server)"
 MODEL_PATTERNS = ["onnx/*", "README.md"]
@@ -216,23 +216,27 @@ def _snapshot(repo: str, revision: str, patterns: list[str], label: str) -> None
     marker.write_text(stamp)
 
 
-def _jina_requirements() -> list[str]:
+def jina_requirements(gpu: GpuConfig) -> list[str]:
+    group = "jina-cuda" if gpu.provider == "cuda" else "jina"
     with (paths.ROOT / "pyproject.toml").open("rb") as fh:
-        return tomllib.load(fh)["project"]["optional-dependencies"]["jina"]
+        return tomllib.load(fh)["project"]["optional-dependencies"][group]
 
 
-def ensure_jina_dependencies() -> None:
+def ensure_jina_dependencies(gpu: GpuConfig) -> None:
     if sys.platform == "win32" and platform.machine().upper() != "AMD64":
         raise RuntimeError("The jina reranker needs PyTorch, which has no Windows ARM64 wheel; use backend = \"bge\".")
-    deps = _jina_requirements()
+    deps = jina_requirements(gpu)
     marker = Path(sys.executable).resolve().parent / ".deps-jina"
     digest = hashlib.sha256("\n".join(sorted(deps)).encode()).hexdigest()
     if marker.exists() and marker.read_text() == digest:
         return
-    say("Installing jina reranker dependencies: " + ", ".join(deps))
+    say("Installing jina reranker dependencies: " + ", ".join(d.split(" @ ")[0] for d in deps)
+        + (" (CUDA build of torch, about 2 GB)" if gpu.provider == "cuda" else ""))
     env = os.environ.copy()
     env["PIP_CACHE_DIR"] = str(paths.CACHE_DIR / "pip")
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    # The CPU and CUDA builds of torch share a name; remove the other one so pip cannot keep it.
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torch"], env=env, capture_output=True)
     _run(
         [sys.executable, "-m", "pip", "install", "--no-warn-script-location", "--only-binary=:all:", *deps],
         env,
@@ -246,10 +250,11 @@ def ensure_rerank(cfg: Config) -> None:
     if not rr.enabled:
         return
     if rr.backend == "bge":
-        _snapshot(rr.bge_repo, rr.bge_revision, [rr.bge_onnx_file, "tokenizer.json", "config.json", "README.md"],
-                  f"{rr.bge_repo} ({rr.bge_onnx_file})")
+        onnx_file = rr.bge_file(cfg.gpu)
+        _snapshot(rr.bge_repo, rr.bge_revision, [onnx_file, "tokenizer.json", "config.json", "README.md"],
+                  f"{rr.bge_repo} ({onnx_file})")
     else:
-        ensure_jina_dependencies()
+        ensure_jina_dependencies(cfg.gpu)
         _snapshot(rr.jina_repo, rr.jina_revision, JINA_PATTERNS, f"{rr.jina_repo} (about 1.2 GB, CC BY-NC 4.0)")
 
     try:

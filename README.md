@@ -31,7 +31,7 @@ First run (needs internet, roughly 3 GB, a few minutes):
 | 4 | `@arabold/docs-mcp-server` (npm) | `runtime\app` |
 | 5 | Chromium for JS-rendered sites (Playwright) | `runtime\browsers` |
 | 6 | BGE-M3 ONNX model (~2.3 GB, resumable) | `runtime\models` |
-| 7 | bge-reranker-v2-m3 ONNX model (int8, ~570 MB) + rerank patch for docs-mcp-server | `runtime\models`, `runtime\app` |
+| 7 | bge-reranker-v2-m3 ONNX model (int8 ~570 MB on CPU, fp16 ~1.1 GB on GPU) + rerank patch for docs-mcp-server | `runtime\models`, `runtime\app` |
 
 Later runs start in seconds and work offline (except for scraping, of course).
 
@@ -94,17 +94,19 @@ docs-mcp-server runs with `APPDATA`/`LOCALAPPDATA` redirected into `runtime\data
 
 docs-mcp-server ranks search candidates with Reciprocal Rank Fusion of vector and full-text search, then keeps the
 top `limit`. It has no rerank step, so docs-portable adds one: after installing docs-mcp-server, setup patches
-`DocumentStore.findByContent` in its `dist` bundle so the top `[rerank] candidates` chunks (default 30) are re-scored
+`DocumentStore.findByContent` in its `dist` bundle so the top `candidates` chunks (default 10 on CPU, 30 on GPU) are re-scored
 by the local `/v1/rerank` endpoint first, before grouping and context assembly.
 
 - The patch is an exact text replacement written for docs-mcp-server **3.4.1**. With any other version setup stops
   with an error instead of guessing; set `[rerank] enabled = false` or pin a supported version.
-- If the rerank server is down, slow (`timeout_ms`) or answers garbage, that search uses the original hybrid order
+- If the rerank server is down, slow (`timeout_ms`) or returns an invalid response, that search uses the original hybrid order
   and docs-mcp-server logs a warning. Search never fails because of the reranker.
 - The rerank endpoint only binds to loopback, and the patch only sends chunks to a loopback `http://` URL.
 - Result scores become rerank scores (bge: 0..1, jina: -1..1) instead of RRF scores.
-- Cost is latency: bge-reranker-v2-m3 has 568M parameters, so on a CPU expect around a few seconds per search with
-  30 candidates. Lower `candidates`/`bge_max_length` for speed. With `limit = 5`, docs-mcp-server only fetches 10
+- Cost is latency, so the limits are set per device in `[rerank.cpu]` and `[rerank.gpu]` (`candidates`,
+  `bge_max_length`, `timeout_ms`); the set for the device the reranker actually runs on is used. bge-reranker-v2-m3
+  has 568M parameters: on a CPU 30 full-size chunks at 1024 tokens take close to a minute, hence the CPU default of
+  10 candidates at 512 tokens; an RTX 4070 laptop GPU handles 30 at 1024 tokens in about 1.5 s. With `limit = 5`, docs-mcp-server only fetches 10
   full-text candidates; `DOCS_MCP_SEARCH_OVERFETCH_FACTOR` in `[docs_mcp.env]` widens that pool.
 - Reranking applies to hybrid search; it is skipped when docs-mcp-server runs without embeddings.
 
@@ -122,6 +124,7 @@ accept_noncommercial_license = true
 The next start installs `torch` (CPU) and `transformers` (pinned in `pyproject.toml` under
 `[project.optional-dependencies] jina`, Windows x64 only, about 1 GB) and downloads the model (~1.2 GB). The model
 ships its own Python code (`trust_remote_code`); docs-portable pins it to a reviewed revision (`jina_revision`).
+With `[gpu] provider = "cuda"` it runs on the GPU in bfloat16 using PyTorch's CUDA build instead.
 
 ## Configuration
 
@@ -134,8 +137,29 @@ extra docs-mcp-server flags and environment variables such as `GITHUB_TOKEN`). N
 - **No GPU needed.** Embeddings run on the CPU by default (`onnxruntime`, no PyTorch/CUDA). Expect roughly 3 GB of RAM
   for the model and slower indexing than on a GPU (queries are fast; a large docs site can take a while to index).
   Tune `threads` (CPU threads, `0` = all cores) and `batch_size` in `config.toml` for your machine.
-- Optional GPU on Windows: replace `onnxruntime` with `onnxruntime-directml` in `pyproject.toml` and set
-  `providers = ["DmlExecutionProvider", "CPUExecutionProvider"]`. If no GPU is present it falls back to the CPU.
+
+### GPU
+
+One setting in `config.toml` moves the embedding model and the reranker to the GPU:
+
+```toml
+[gpu]
+provider = "cuda"      # "none" (CPU), "cuda" (NVIDIA) or "directml" (any DirectX 12 GPU)
+device_id = 0          # which GPU, if there are several
+```
+
+The next `start.bat` swaps in the matching onnxruntime build (`[project.optional-dependencies]` in `pyproject.toml`)
+and, for bge, downloads the fp16 reranker instead of int8 (`bge_onnx_file = "auto"`). The launcher prints where each
+model runs (`cpu`, `cuda` or `directml`); if the GPU is not usable it says so and continues on the CPU.
+
+| provider | Package | Extra download | Notes |
+|---|---|---|---|
+| `cuda` | `onnxruntime-gpu[cuda,cudnn]` | ~2.5 GB (CUDA 13 + cuDNN 9 wheels) | NVIDIA only, recent driver. With `backend = "jina"` also the CUDA build of PyTorch 2.14.1 (~2 GB, pinned by URL + sha256). |
+| `directml` | `onnxruntime-directml` | ~25 MB | NVIDIA/AMD/Intel. DirectML is in maintenance mode (last release 1.24.4); jina stays on the CPU. |
+
+GPU builds are Windows x64 only. Switching back to `"none"` reinstalls the CPU build; the CUDA wheels stay in
+`runtime\python` until you delete that folder. Virtual display adapters (e.g. Android emulators) count as GPUs for
+DirectML, so set `device_id` if the wrong one is picked.
 
 ## Requirements and limits
 
@@ -149,4 +173,5 @@ extra docs-mcp-server flags and environment variables such as `GITHUB_TOKEN`). N
 This project is MIT licensed. It downloads, at runtime, docs-mcp-server (MIT), BGE-M3 (MIT), bge-reranker-v2-m3
 (Apache-2.0), Node.js (MIT), Python (PSF), pip (MIT) and Chromium via Playwright (BSD-style/Apache-2.0); each keeps
 its own license. Only when explicitly enabled: jina-reranker-v3.5 (**CC BY-NC 4.0, non-commercial**), PyTorch
-(BSD-3-Clause) and transformers (Apache-2.0).
+(BSD-3-Clause) and transformers (Apache-2.0); with `[gpu]`: onnxruntime-gpu / onnxruntime-directml (MIT) and the
+NVIDIA CUDA/cuDNN runtime wheels (NVIDIA software license).

@@ -37,23 +37,89 @@ class RerankConfigTest(unittest.TestCase):
                 parse_config({"rerank": {"host": host}})
 
     def test_rejects_out_of_range_or_mistyped_numbers(self):
-        for key, value in (
-            ("candidates", 0),
-            ("candidates", 201),
-            ("candidates", -5),
-            ("candidates", "30"),
-            ("candidates", True),
-            ("timeout_ms", 10),
-            ("port", 70000),
-            ("bge_max_length", 1),
-            ("batch_size", 0),
-        ):
+        for key, value in (("port", 70000), ("port", "8082"), ("batch_size", 0), ("threads", -1)):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
                 parse_config({"rerank": {key: value}})
+
+    def test_rejects_bad_per_device_limits(self):
+        for device in ("cpu", "gpu"):
+            for key, value in (
+                ("candidates", 0),
+                ("candidates", 201),
+                ("candidates", -5),
+                ("candidates", "30"),
+                ("candidates", True),
+                ("timeout_ms", 10),
+                ("bge_max_length", 1),
+                ("bge_max_length", 9000),
+            ):
+                with self.subTest(device=device, key=key, value=value), \
+                        self.assertRaisesRegex(ValueError, rf"rerank\.{device}\] {key}"):
+                    parse_config({"rerank": {device: {key: value}}})
+
+    def test_rejects_unknown_or_malformed_limit_tables(self):
+        with self.assertRaisesRegex(ValueError, "unknown option"):
+            parse_config({"rerank": {"cpu": {"depth": 3}}})
+        with self.assertRaisesRegex(ValueError, "must be a table"):
+            parse_config({"rerank": {"gpu": 30}})
+
+    def test_old_single_limits_point_to_device_tables(self):
+        for key in ("candidates", "timeout_ms", "bge_max_length"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, r"\[rerank\.cpu\] and \[rerank\.gpu\]"):
+                parse_config({"rerank": {key: 30}})
+
+    def test_limits_follow_actual_device(self):
+        cfg = parse_config({"rerank": {"cpu": {"candidates": 5}, "gpu": {"timeout_ms": 5000}}}).rerank
+        self.assertEqual((cfg.limits("cpu").candidates, cfg.limits("cpu").bge_max_length), (5, 512))
+        self.assertEqual(cfg.limits("cpu").timeout_ms, 30000)
+        for device in ("cuda", "directml"):
+            self.assertEqual(cfg.limits(device).candidates, 30)
+            self.assertEqual(cfg.limits(device).timeout_ms, 5000)
+
+    def test_partial_table_keeps_other_defaults_and_does_not_leak(self):
+        first = parse_config({"rerank": {"cpu": {"candidates": 3}}}).rerank
+        second = parse_config({}).rerank
+        self.assertEqual(first.cpu.candidates, 3)
+        self.assertEqual(second.cpu.candidates, 10)
 
     def test_rejects_unknown_option(self):
         with self.assertRaisesRegex(ValueError, "unknown option"):
             parse_config({"rerank": {"depth": 10}})
+
+
+class GpuConfigTest(unittest.TestCase):
+    def test_default_is_cpu(self):
+        cfg = parse_config({})
+        self.assertEqual(cfg.gpu.provider, "none")
+        self.assertFalse(cfg.gpu.enabled)
+        self.assertEqual(cfg.gpu.onnx_providers(), ["CPUExecutionProvider"])
+
+    def test_cuda_and_directml_providers_keep_cpu_fallback(self):
+        cuda = parse_config({"gpu": {"provider": "cuda", "device_id": 1}}).gpu
+        self.assertEqual(cuda.onnx_providers(), [("CUDAExecutionProvider", {"device_id": 1}), "CPUExecutionProvider"])
+        dml = parse_config({"gpu": {"provider": "directml"}}).gpu
+        self.assertEqual(dml.onnx_providers(), [("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"])
+
+    def test_rejects_invalid_values(self):
+        for gpu in ({"provider": "rocm"}, {"provider": True}, {"provider": "CUDA"}, {"device_id": -1},
+                    {"device_id": "0"}, {"device_id": True}, {"device_id": 65}, {"enabled": True}):
+            with self.subTest(gpu=gpu), self.assertRaises(ValueError):
+                parse_config({"gpu": gpu})
+
+    def test_old_providers_option_points_to_gpu_section(self):
+        for section in ("embedding", "rerank"):
+            with self.subTest(section=section), self.assertRaisesRegex(ValueError, r"\[gpu\]"):
+                parse_config({section: {"providers": ["DmlExecutionProvider"]}})
+
+    def test_bge_file_auto_follows_gpu(self):
+        cpu = parse_config({})
+        self.assertEqual(cpu.rerank.bge_file(cpu.gpu), "onnx/model_int8.onnx")
+        gpu = parse_config({"gpu": {"provider": "cuda"}})
+        self.assertEqual(gpu.rerank.bge_file(gpu.gpu), "onnx/model_fp16.onnx")
+
+    def test_explicit_bge_file_wins(self):
+        cfg = parse_config({"gpu": {"provider": "directml"}, "rerank": {"bge_onnx_file": "onnx/model.onnx"}})
+        self.assertEqual(cfg.rerank.bge_file(cfg.gpu), "onnx/model.onnx")
 
 
 if __name__ == "__main__":

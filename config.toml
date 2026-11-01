@@ -1,5 +1,18 @@
 # docs-portable configuration. Edit freely; changes apply on the next start.
 
+[gpu]
+# Where the embedding and reranker models run:
+#   "none"     = CPU only (default, works everywhere).
+#   "cuda"     = NVIDIA GPU. Installs onnxruntime-gpu plus the CUDA 13/cuDNN 9 runtime from pip
+#                (~2.5 GB, no system CUDA needed); with [rerank] backend = "jina" also the CUDA
+#                build of PyTorch (~2 GB). Needs a recent NVIDIA driver (CUDA 13).
+#   "directml" = any DirectX 12 GPU (NVIDIA, AMD, Intel) via onnxruntime-directml. Smaller, but
+#                Microsoft no longer develops DirectML; jina stays on the CPU.
+# GPU builds are Windows x64 only. Switching reinstalls onnxruntime on the next start.
+provider = "cuda"
+# GPU index if there is more than one adapter (virtual display adapters count too).
+device_id = 0
+
 [embedding]
 # Hugging Face repo that is downloaded on first run (its ONNX export is used).
 model_repo = "BAAI/bge-m3"
@@ -14,10 +27,6 @@ max_length = 8192
 batch_size = 8
 # CPU threads for inference, 0 = onnxruntime default.
 threads = 0
-# onnxruntime execution providers, in order of preference.
-# GPU users: swap `onnxruntime` for `onnxruntime-directml` in pyproject.toml,
-# then use ["DmlExecutionProvider", "CPUExecutionProvider"].
-providers = ["CPUExecutionProvider"]
 # Log every /v1/embeddings request.
 access_log = false
 
@@ -27,27 +36,38 @@ access_log = false
 enabled = true
 # "bge"  = BAAI/bge-reranker-v2-m3 (Apache-2.0), onnxruntime, no extra Python packages.
 # "jina" = jinaai/jina-reranker-v3.5 (CC BY-NC 4.0 - NON-COMMERCIAL USE ONLY). Installs
-#          torch + transformers (~1 GB, Windows x64 only) on the next start.
+#          torch + transformers (~1 GB, Windows x64 only) on the next start; uses the GPU with
+#          [gpu] provider = "cuda".
 backend = "bge"
 # Required for backend = "jina": confirms this installation is for non-commercial use.
 accept_noncommercial_license = false
 host = "127.0.0.1"
 port = 8082
-# Hybrid candidates re-scored per search. More = better recall of the reranker, slower search.
-# docs-mcp-server only fetches limit * DOCS_MCP_SEARCH_OVERFETCH_FACTOR full-text candidates
-# (5 * 2 = 10 by default); raise that factor in [docs_mcp.env] to give the reranker more to work with.
-candidates = 30
-# If a rerank call takes longer, docs-mcp-server keeps its hybrid order for that search.
-timeout_ms = 30000
-# bge ONNX variant: onnx/model_int8.onnx (570 MB, fastest on CPU), onnx/model_fp16.onnx, onnx/model.onnx (fp32).
-bge_onnx_file = "onnx/model_int8.onnx"
-# Tokens per (query, chunk) pair; docs-mcp-server chunks are up to ~1300 tokens.
-bge_max_length = 1024
+# bge ONNX variant. "auto" = onnx/model_fp16.onnx (1.1 GB) on a GPU, onnx/model_int8.onnx (570 MB) on the
+# CPU. Or name one: onnx/model_int8.onnx, onnx/model_fp16.onnx, onnx/model.onnx (fp32, 2.3 GB).
+bge_onnx_file = "auto"
 # Pairs per ONNX forward pass (bge) and CPU threads (0 = default).
 batch_size = 8
 threads = 0
-providers = ["CPUExecutionProvider"]
 access_log = false
+
+# Cost limits, one set per device. The set matching where the reranker really runs is used
+# ([rerank.cpu] also applies when a GPU was requested but is not usable).
+#   candidates     = hybrid candidates re-scored per search. More = better reranking, slower search.
+#                    docs-mcp-server only fetches limit * DOCS_MCP_SEARCH_OVERFETCH_FACTOR full-text
+#                    candidates (5 * 2 = 10 by default); raise that factor in [docs_mcp.env] for more.
+#   bge_max_length = tokens per (query, chunk) pair; docs-mcp-server chunks are up to ~1300 tokens.
+#   timeout_ms     = if a rerank call takes longer, that search keeps its hybrid order.
+[rerank.cpu]
+# int8 bge on a CPU needs roughly 1.5 s per full-size chunk at 1024 tokens.
+candidates = 10
+bge_max_length = 512
+timeout_ms = 30000
+
+[rerank.gpu]
+candidates = 30
+bge_max_length = 1024
+timeout_ms = 30000
 
 [docs_mcp]
 package = "@arabold/docs-mcp-server"
