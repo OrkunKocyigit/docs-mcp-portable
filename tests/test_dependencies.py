@@ -60,12 +60,12 @@ class JinaRequirementsTest(unittest.TestCase):
 
 class TorchRequirementsTest(unittest.TestCase):
     def test_nothing_without_torch_features(self):
-        self.assertEqual(installer.torch_requirements(parse_config({})), [])
+        self.assertEqual(installer.extra_requirements(parse_config({})), [])
 
     def test_jev_and_jina_share_one_torch(self):
         cfg = parse_config({"gpu": {"provider": "cuda"}, "jev": {"enabled": True},
                             "rerank": {"backend": "jina", "accept_noncommercial_license": True}})
-        deps = installer.torch_requirements(cfg)
+        deps = installer.extra_requirements(cfg)
         self.assertEqual([bootstrap.requirement_name(d) for d in deps].count("torch"), 1)
         self.assertEqual(len(deps), len(set(deps)))
         for package in ("accelerate==1.15.0", "bitsandbytes==0.50.2", "transformers==5.22.1"):
@@ -75,6 +75,43 @@ class TorchRequirementsTest(unittest.TestCase):
     def test_jev_packages_are_pinned(self):
         for req in PROJECT["optional-dependencies"]["jev"]:
             self.assertTrue("==" in req or "#sha256=" in req, req)
+
+
+class CodeRequirementsTest(unittest.TestCase):
+    def test_all_code_packages_are_pinned(self):
+        for group in ("code", "code-embed", "code-embed-cuda"):
+            for req in PROJECT["optional-dependencies"][group]:
+                with self.subTest(group=group, req=req):
+                    self.assertTrue("==" in req or "#sha256=" in req, req)
+
+    def test_filelock_has_the_2026_advisory_fixes(self):
+        pin = next(r for r in PROJECT["optional-dependencies"]["code"] if r.startswith("filelock=="))
+        major, minor, patch = (int(x) for x in pin.removeprefix("filelock==").split("."))
+        self.assertGreaterEqual((major, minor, patch), (4, 2, 1))
+
+    def test_cuda_uses_8bit_capable_torch_build(self):
+        deps = installer.code_requirements(GpuConfig(provider="cuda"))
+        self.assertIn("bitsandbytes==0.50.2", deps)
+        self.assertEqual(installer._wanted_torch(deps), "2.14.1+cu130")
+        self.assertIn("cocoindex-code==0.2.42", deps)
+
+    def test_cpu_has_no_bitsandbytes(self):
+        deps = installer.code_requirements(GpuConfig())
+        self.assertNotIn("bitsandbytes", [bootstrap.requirement_name(d) for d in deps])
+        self.assertEqual(installer._wanted_torch(deps), "2.15.0")
+
+    def test_shares_one_torch_with_jev_and_jina(self):
+        cfg = parse_config({"gpu": {"provider": "cuda"}, "jev": {"enabled": True}, "code_search": {"enabled": True},
+                            "rerank": {"backend": "jina", "accept_noncommercial_license": True}})
+        deps = installer.extra_requirements(cfg)
+        self.assertEqual([bootstrap.requirement_name(d) for d in deps].count("torch"), 1)
+        self.assertEqual(len(deps), len(set(deps)))
+
+    def test_disabled_installs_nothing_extra(self):
+        self.assertEqual(installer.extra_requirements(parse_config({"code_search": {"enabled": False}})), [])
+
+    def test_model_snapshot_skips_remote_code(self):
+        self.assertFalse([p for p in installer.CODE_MODEL_PATTERNS if p.endswith(".py")])
 
     def test_wanted_torch_from_pypi_pin(self):
         self.assertEqual(installer._wanted_torch(["transformers==1", "torch==2.15.0"]), "2.15.0")

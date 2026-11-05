@@ -19,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("embedding-server", help="run just the OpenAI-compatible embedding server")
     sub.add_parser("rerank-server", help="run just the /v1/rerank server")
     sub.add_parser("jev-server", help="run just the JEV-9B /v1/systemone server (needs DOCS_PORTABLE_JEV_TOKEN)")
+    sub.add_parser("code-embedding-server", help="run just the bge-code-v1 /v1/embeddings server")
+    sub.add_parser("code-server", help="run just the Code page (+ /mcp); needs the code embedding server")
     cli = sub.add_parser("cli", help="run the docs-mcp-server CLI (scrape, search, list, ...) with this setup")
     cli.add_argument("cli_args", nargs=argparse.REMAINDER, help="arguments passed to docs-mcp-server")
     args = parser.parse_args(argv)
@@ -49,6 +51,19 @@ def main(argv: list[str] | None = None) -> int:
         from .jev_server import main as serve_jev
 
         serve_jev()
+        return 0
+    if command in ("code-embedding-server", "code-server") and not cfg.code_search.enabled:
+        print("config.toml: set [code_search] enabled = true and run `start.bat setup` first.", file=sys.stderr)
+        return 2
+    if command == "code-embedding-server":
+        from .code_embedding_server import main as serve_code_embed
+
+        serve_code_embed()
+        return 0
+    if command == "code-server":
+        from .code_service import main as serve_code
+
+        serve_code()
         return 0
 
     from .launcher import run, run_cli

@@ -257,6 +257,106 @@ class JevConfig:
             )
 
 
+CODE_QUANTIZATIONS = ("int8", "nf4", "fp16")
+CODE_LIMIT_KEYS = ("batch_size", "max_length")
+_HOSTNAME = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+_IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+@dataclass
+class CodeLimits:
+    """Per-device cost knobs ([code_search.cpu] / [code_search.gpu]) for bge-code-v1."""
+
+    batch_size: int
+    # Tokens per chunk (bge-code-v1 was evaluated at 4096); attention memory grows with its square.
+    max_length: int
+
+    def validate(self, name: str) -> None:
+        for key, low, high in (("batch_size", 1, 128), ("max_length", 64, 8192)):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"config.toml: [{name}] {key} must be an integer between {low} and {high}")
+
+
+@dataclass
+class CodeSearchConfig:
+    """cocoindex-code behind a local Code page (+ read-only MCP), embeddings from BAAI/bge-code-v1."""
+
+    enabled: bool = False
+    # Code page, REST API and MCP endpoint (/mcp).
+    host: str = "127.0.0.1"
+    port: int = 6290
+    # OpenAI/NIM-compatible bge-code-v1 endpoint used by cocoindex-code.
+    embed_host: str = "127.0.0.1"
+    embed_port: int = 8084
+    model_repo: str = "BAAI/bge-code-v1"
+    revision: str = "bd67852057c5d7ddcc7b8234d9d6c410117ed851"
+    model_name: str = "bge-code-v1"
+    # Weights on an NVIDIA GPU: "int8" (bitsandbytes), "nf4" or "fp16". On the CPU the model runs in float32.
+    quantization: str = "int8"
+    # Prepended to search queries only (bge-code-v1 is asymmetric); indexed code is embedded as is.
+    query_instruction: str = "Given a web search query, retrieve relevant code that can help answer the query."
+    cpu: CodeLimits = field(default_factory=lambda: CodeLimits(batch_size=4, max_length=1024))
+    gpu: CodeLimits = field(default_factory=lambda: CodeLimits(batch_size=8, max_length=1024))
+    threads: int = 0
+    # Git hosts the Code page may clone from (https only). Add self-hosted GitLab/Gitea hosts here.
+    git_hosts: list[str] = field(default_factory=lambda: ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"])
+    clone_timeout_s: int = 1800
+    # Files larger than this are not indexed (generated code, data dumps).
+    max_file_size_kb: int = 1024
+    access_log: bool = False
+
+    @property
+    def embed_base_url(self) -> str:
+        return f"http://{self.embed_host}:{self.embed_port}/v1"
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def limits(self, device: str) -> CodeLimits:
+        return self.cpu if device == "cpu" else self.gpu
+
+    def validate(self) -> None:
+        for name in ("enabled", "access_log"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"config.toml: [code_search] {name} must be true or false")
+        # The page can index and delete; the endpoint receives source code. Keep both on this machine.
+        for name in ("host", "embed_host"):
+            if getattr(self, name) not in LOOPBACK_HOSTS:
+                raise ValueError(f"config.toml: [code_search] {name} must be one of {', '.join(LOOPBACK_HOSTS)}")
+        if self.quantization not in CODE_QUANTIZATIONS:
+            raise ValueError(f"config.toml: [code_search] quantization must be one of {', '.join(CODE_QUANTIZATIONS)}")
+        if not isinstance(self.revision, str) or not _GIT_SHA.match(self.revision):
+            raise ValueError("config.toml: [code_search] revision must be a full 40-character commit hash")
+        if not isinstance(self.model_name, str) or not re.match(r"^[A-Za-z0-9._-]{1,64}$", self.model_name):
+            raise ValueError("config.toml: [code_search] model_name may only contain letters, digits, '.', '_' and '-'")
+        if not isinstance(self.query_instruction, str) or not 0 < len(self.query_instruction) <= 500:
+            raise ValueError("config.toml: [code_search] query_instruction must be a string of 1 to 500 characters")
+        for name, low, high in (
+            ("port", 1, 65535),
+            ("embed_port", 1, 65535),
+            ("threads", 0, 1024),
+            ("clone_timeout_s", 30, 86400),
+            ("max_file_size_kb", 1, 1024 * 1024),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"config.toml: [code_search] {name} must be an integer between {low} and {high}")
+        if self.port == self.embed_port:
+            raise ValueError("config.toml: [code_search] port and embed_port must differ")
+        if not isinstance(self.git_hosts, list):
+            raise ValueError("config.toml: [code_search] git_hosts must be a list of host names")
+        for host in self.git_hosts:
+            if not isinstance(host, str) or not _HOSTNAME.match(host) or _IPV4.match(host) or host == "localhost":
+                raise ValueError(
+                    f"config.toml: [code_search] git_hosts: {host!r} is not a lower-case public host name "
+                    "(no scheme, port, path or IP address)"
+                )
+        self.cpu.validate("code_search.cpu")
+        self.gpu.validate("code_search.gpu")
+
+
 @dataclass
 class DocsMcpConfig:
     package: str = "@arabold/docs-mcp-server"
@@ -280,11 +380,12 @@ class Config:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     rerank: RerankConfig = field(default_factory=RerankConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    code_search: CodeSearchConfig = field(default_factory=CodeSearchConfig)
     docs_mcp: DocsMcpConfig = field(default_factory=DocsMcpConfig)
     node: NodeConfig = field(default_factory=NodeConfig)
 
 
-SECTIONS = ("gpu", "embedding", "rerank", "jev", "docs_mcp", "node")
+SECTIONS = ("gpu", "embedding", "rerank", "jev", "code_search", "docs_mcp", "node")
 
 
 def _fill(section: Any, values: dict[str, Any], name: str) -> None:
@@ -302,6 +403,11 @@ def _fill(section: Any, values: dict[str, Any], name: str) -> None:
         if key in EMBEDDING_LIMIT_KEYS and name == "embedding":
             raise ValueError(
                 f"config.toml: [embedding] {key} moved to [embedding.cpu] and [embedding.gpu] (one value per device)"
+            )
+        if key in CODE_LIMIT_KEYS and name == "code_search":
+            raise ValueError(
+                f"config.toml: [code_search] {key} belongs in [code_search.cpu] and [code_search.gpu] "
+                "(one value per device)"
             )
         if key not in known:
             raise ValueError(f"config.toml: unknown option [{name}] {key}")
@@ -326,6 +432,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     cfg.embedding.validate()
     cfg.rerank.validate()
     cfg.jev.validate(cfg.gpu)
+    cfg.code_search.validate()
     return cfg
 
 

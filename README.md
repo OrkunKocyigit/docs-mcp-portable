@@ -33,6 +33,7 @@ First run (needs internet, roughly 3 GB, a few minutes):
 | 6 | BGE-M3 ONNX model (~2.3 GB, resumable) | `runtime\models` |
 | 7 | bge-reranker-v2-m3 ONNX model (int8 ~570 MB on CPU, fp16 ~1.1 GB on GPU) + rerank patch for docs-mcp-server | `runtime\models`, `runtime\app` |
 | 8 | Only with `[jev] enabled = true`: PyTorch CUDA extras, JEV-9B (~18 GB) and jev-mcp | `runtime\python`, `runtime\models`, `runtime\jev-mcp` |
+| 9 | Only with `[code_search] enabled = true`: cocoindex-code, PyTorch and bge-code-v1 (~6.2 GB) | `runtime\python`, `runtime\models`, `runtime\data\code` |
 
 Later runs start in seconds and work offline (except for scraping, of course).
 
@@ -59,6 +60,8 @@ start.bat setup              rem only download/install
 start.bat embedding-server   rem only the embedding endpoint
 start.bat rerank-server      rem only the rerank endpoint
 start.bat jev-server         rem only the JEV-9B endpoint (needs DOCS_PORTABLE_JEV_TOKEN, 32+ chars)
+start.bat code-embedding-server  rem only the bge-code-v1 endpoint ([code_search] enabled)
+start.bat code-server        rem only the Code page + /mcp (needs the code embedding endpoint)
 start.bat cli <args...>      rem docs-mcp-server CLI with the same portable data and embedding setup
 ```
 
@@ -204,6 +207,50 @@ already up; then the launcher prints where its layers went and starts jev-mcp:
   probability-weighted level. States longer than `max_state_tokens` keep their first 60% and last 40%. Images are
   rejected. Answers are close to hosted Jev, not identical (see the model card's limitations).
 
+## Code search (Code page + MCP)
+
+[cocoindex-code](https://github.com/cocoindex-io/cocoindex-code) (Apache-2.0) indexes source code by syntax
+(tree-sitter) and searches it by meaning. docs-portable runs it with
+[BAAI/bge-code-v1](https://huggingface.co/BAAI/bge-code-v1) (Apache-2.0) and adds a web page to manage it:
+
+```toml
+[code_search]
+enabled = true
+quantization = "int8"   # on an NVIDIA GPU: "int8" (~2 GB VRAM), "nf4" or "fp16"; float32 on the CPU
+```
+
+The next start installs cocoindex-code and PyTorch (pinned under `[project.optional-dependencies] code` /
+`code-embed-cuda`) and downloads the model (~6.2 GB, pinned to `revision`). Then:
+
+- Code page: <http://127.0.0.1:6290>. Add a **local folder** (absolute path) or a **git repository**
+  (`https://` URL, optional branch/tag); it is cloned into `runtime\data\code\repos` and indexed. *Re-index* /
+  *Pull + index* updates incrementally; *Remove* deletes the index (and the clone for git projects).
+- MCP (read-only): `list_projects`, `search_code`
+
+  ```json
+  { "mcpServers": { "code-search": { "url": "http://127.0.0.1:6290/mcp" } } }
+  ```
+
+How it fits together:
+
+- bge-code-v1 is served on `http://127.0.0.1:8084/v1/embeddings` (`code_embedding_server`). It is asymmetric:
+  search queries get the instruction prefix (`query_instruction`), indexed code does not. cocoindex-code calls the
+  endpoint through LiteLLM's `nvidia_nim` provider, which passes `input_type` (`query` / `passage`) along.
+- The tokenizer comes from the snapshot's `tokenizer.json`; the repository's `tokenization_qwen.py` (remote code) is
+  not downloaded or run.
+- cocoindex-code's settings, daemon and **indexes** live in `runtime\data\code`; usage tracking is off. A local
+  project only gets a small `.cocoindex_code\settings.yml` marker, which is added to the repository's
+  `.git\info\exclude` (never to `.gitignore`).
+- Git clones are shallow and https-only (`protocol.allow=never` except https, no redirects, no symlinks, no
+  submodules). Only hosts in `git_hosts` are allowed; private repositories use git's credential helper (never put
+  tokens in the URL).
+- Refused local folders: whole drives, your user profile folder itself (subfolders are fine), system folders,
+  network/UNC paths and anything that contains `runtime\`.
+- The page and the API accept only loopback `Host` headers; changes need the page's per-run CSRF token and a
+  same-origin `Origin`. Indexing jobs run one at a time.
+
+Code search is optional like JEV: if it cannot start, docs search keeps running.
+
 ## Requirements and limits
 
 - Windows 10 (1803+) or 11, x64 or ARM64, and internet on first run. The batch file only uses `curl.exe` and
@@ -218,4 +265,5 @@ This project is MIT licensed. It downloads, at runtime, docs-mcp-server (MIT), B
 its own license. Only when explicitly enabled: jina-reranker-v3.5 (**CC BY-NC 4.0, non-commercial**), PyTorch
 (BSD-3-Clause) and transformers (Apache-2.0); with `[gpu]`: onnxruntime-gpu / onnxruntime-directml (MIT) and the
 NVIDIA CUDA/cuDNN runtime wheels (NVIDIA software license); with `[jev]`: autotrust/JEV-9B and its base Qwen3.5-9B
-(Apache-2.0), accelerate (Apache-2.0), bitsandbytes (MIT) and jev-mcp (MIT).
+(Apache-2.0), accelerate (Apache-2.0), bitsandbytes (MIT) and jev-mcp (MIT); with `[code_search]`: cocoindex-code
+and cocoindex (Apache-2.0), LiteLLM (MIT), BAAI/bge-code-v1 (Apache-2.0) and PyTorch/transformers as above.

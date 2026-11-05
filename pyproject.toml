@@ -31,6 +31,26 @@ jina-cuda = [
     "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
     "transformers==5.22.1",
 ]
+# [code_search] enabled = true: cocoindex-code (Code page, code-search MCP) and bge-code-v1 on PyTorch.
+# Exact pins checked against OSV; filelock >= 4.2.1 fixes the 2026 lock advisories pulled in through litellm.
+code = [
+    "cocoindex-code==0.2.42",
+    "cocoindex==1.0.26",
+    "litellm==1.103.10",
+    "mcp==2.3.0",
+    "filelock==4.2.9",
+]
+code-embed = [
+    "torch==2.15.0",
+    "transformers==5.22.1",
+]
+# bge-code-v1 on an NVIDIA GPU: same CUDA torch as jina-cuda / jev, plus bitsandbytes for 8-bit weights.
+code-embed-cuda = [
+    "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
+    "transformers==5.22.1",
+    "accelerate==1.15.0",
+    "bitsandbytes==0.50.2",
+]
 # [jev] enabled = true (autotrust/JEV-9B behind jev-mcp); needs [gpu] provider = "cuda".
 # accelerate offloads layers to RAM, bitsandbytes provides int8 / nf4 (the System 1 LoRA is applied by jev_server).
 jev = [

@@ -143,6 +143,36 @@ def _smoke_test_rerank(cfg: Config) -> str:
     return device
 
 
+def _smoke_test_code(cfg: Config) -> None:
+    code = cfg.code_search
+    body = json.dumps({"model": code.model_name, "input": ["fn main() {}"], "input_type": "query"}).encode()
+    req = urllib.request.Request(f"{code.embed_base_url}/embeddings", body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        dim = len(json.load(r)["data"][0]["embedding"])
+    device = _device(f"http://{code.embed_host}:{code.embed_port}/health")
+    print(f"[run] Code embedding endpoint ready: {code.embed_base_url} ({code.model_name}, {dim} dims, {device})",
+          flush=True)
+
+
+def _start_code_search(cfg: Config) -> tuple[subprocess.Popen, subprocess.Popen]:
+    """bge-code-v1 endpoint, then the Code page; raises RuntimeError (after cleaning up) if either fails."""
+    code = cfg.code_search
+    embed = service = None
+    try:
+        print(f"[run] Loading {code.model_name} ({code.quantization} on a GPU)...", flush=True)
+        embed = subprocess.Popen([sys.executable, "-m", "docs_portable.code_embedding_server"], env=_model_env())
+        _wait_healthy(f"http://{code.embed_host}:{code.embed_port}/health", embed, "Code embedding server")
+        _smoke_test_code(cfg)
+        service = subprocess.Popen([sys.executable, "-m", "docs_portable.code_service"], env=os.environ.copy())
+        _wait_healthy(f"{code.url}/health", service, "Code page")
+        print(f"[run] Code page ready -> {code.url}  (MCP: {code.url}/mcp)", flush=True)
+        return embed, service
+    except (RuntimeError, urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+        _stop(service)
+        _stop(embed)
+        raise RuntimeError(f"Code search did not start: {exc}") from exc
+
+
 def _rerank_device(cfg: Config) -> str:
     """Device of a running rerank server, else the one config.toml asks for."""
     rr = cfg.rerank
@@ -252,12 +282,14 @@ def run(cfg: Config) -> int:
     installer.ensure_all(cfg)
     _kill_children_with_launcher()
 
-    emb, rr, docs, jev = cfg.embedding, cfg.rerank, cfg.docs_mcp, cfg.jev
+    emb, rr, docs, jev, code = cfg.embedding, cfg.rerank, cfg.docs_mcp, cfg.jev, cfg.code_search
     ports = [("embedding", emb.host, emb.port), ("docs-mcp-server", docs.host, docs.port)]
     if rr.enabled:
         ports.append(("rerank", rr.host, rr.port))
     if jev.enabled:
         ports += [("jev", jev.host, jev.port), ("jev-mcp", jev.mcp_host, jev.mcp_port)]
+    if code.enabled:
+        ports += [("code embedding", code.embed_host, code.embed_port), ("code page", code.host, code.port)]
     for name, host, port in ports:
         if not _port_free(host, port):
             print(f"[run] Port {port} ({name}) is already in use. Change it in config.toml.", file=sys.stderr)
@@ -268,6 +300,8 @@ def run(cfg: Config) -> int:
     server: subprocess.Popen | None = None
     jev_server: subprocess.Popen | None = None
     jev_mcp: subprocess.Popen | None = None
+    code_embed: subprocess.Popen | None = None
+    code_page: subprocess.Popen | None = None
     jev_token = secrets.token_urlsafe(32)
     try:
         print("[run] Starting embedding server...", flush=True)
@@ -301,12 +335,26 @@ def run(cfg: Config) -> int:
         ]
         print(f"[run] Starting docs-mcp-server -> http://{docs.host}:{docs.port}  (MCP: /mcp)", flush=True)
         server = subprocess.Popen(cmd, env=docs_mcp_env(cfg, rerank_device))
+        if code.enabled:
+            # Optional like JEV: docs search keeps running if code search cannot start.
+            try:
+                code_embed, code_page = _start_code_search(cfg)
+            except RuntimeError as exc:
+                print(f"[run] {exc}; continuing without code search.", file=sys.stderr, flush=True)
 
         while True:
             for proc, name in ((embed, "embedding server"), (rerank, "rerank server"), (server, "docs-mcp-server")):
                 if proc is not None and proc.poll() is not None:
                     print(f"[run] {name} exited with code {proc.returncode}; shutting down.", flush=True)
                     return proc.returncode or 1
+            for proc, name in ((code_embed, "code embedding server"), (code_page, "code page")):
+                if proc is not None and proc.poll() is not None:
+                    print(f"[run] {name} exited with code {proc.returncode}; continuing without code search.",
+                          file=sys.stderr, flush=True)
+                    _stop(code_page)
+                    _stop(code_embed)
+                    code_embed = code_page = None
+                    break
             # JEV is optional: if it fails, docs search keeps running without it.
             if jev_server is not None:
                 if jev_server.poll() is not None or (jev_mcp is None and time.monotonic() > jev_deadline):
@@ -345,6 +393,8 @@ def run(cfg: Config) -> int:
         print(f"[run] {exc}", file=sys.stderr)
         return 1
     finally:
+        _stop(code_page)
+        _stop(code_embed)
         _stop(jev_mcp)
         _stop(jev_server)
         _stop(server)

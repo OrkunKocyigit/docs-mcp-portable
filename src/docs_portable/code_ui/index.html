@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>Code search - docs-portable</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Code search</h1>
+    <nav><a href="__DOCS_URL__">Docs</a></nav>
+  </header>
+
+  <main>
+    <section>
+      <h2>Add a project</h2>
+      <form id="add-form" autocomplete="off">
+        <fieldset class="kinds">
+          <label><input type="radio" name="kind" value="local" checked> Local folder</label>
+          <label><input type="radio" name="kind" value="git"> Git repository</label>
+        </fieldset>
+        <div class="row" data-kind="local">
+          <input id="add-path" type="text" placeholder="D:\Projects\my-app" spellcheck="false">
+        </div>
+        <div class="row" data-kind="git" hidden>
+          <input id="add-url" type="text" placeholder="https://github.com/owner/repo" spellcheck="false">
+          <input id="add-ref" type="text" placeholder="branch or tag (optional)" spellcheck="false" class="narrow">
+        </div>
+        <button type="submit">Add and index</button>
+        <p id="add-status" class="status" role="status"></p>
+      </form>
+    </section>
+
+    <section>
+      <h2>Projects</h2>
+      <p id="projects-empty" class="muted">No projects yet.</p>
+      <table id="projects" hidden>
+        <thead><tr><th>Name</th><th>Source</th><th>Index</th><th>State</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Search</h2>
+      <form id="search-form" autocomplete="off">
+        <div class="row">
+          <select id="search-project" aria-label="Project"></select>
+          <input id="search-query" type="text" placeholder="where are retries handled?" spellcheck="false">
+          <button type="submit">Search</button>
+        </div>
+        <div class="row filters">
+          <input id="search-languages" type="text" placeholder="languages, e.g. rust, toml" class="narrow" spellcheck="false">
+          <input id="search-paths" type="text" placeholder="path globs, e.g. src/*" class="narrow" spellcheck="false">
+          <label>Results <input id="search-limit" type="number" min="1" max="50" value="10" class="tiny"></label>
+        </div>
+        <p id="search-status" class="status" role="status"></p>
+      </form>
+      <ol id="results"></ol>
+    </section>
+
+    <section>
+      <h2>Jobs</h2>
+      <ul id="jobs" class="jobs"></ul>
+    </section>
+
+    <section>
+      <h2>MCP</h2>
+      <p>Read-only tools <code>list_projects</code> and <code>search_code</code> at <code id="mcp-url">__MCP_URL__</code>.</p>
+      <pre id="mcp-config"></pre>
+    </section>
+  </main>
+</body>
+</html>

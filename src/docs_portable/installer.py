@@ -29,6 +29,8 @@ JEV_PATTERNS = ["config.json", "model-*.safetensors", "model.safetensors.index.j
                 "tokenizer_config.json", "chat_template.jinja", "head.safetensors", "judge_config.json",
                 "calibration.json", "adapter/*", "README.md"]
 JEV_MCP_PACKAGE = "@jkudish/jev-mcp"
+CODE_MODEL_PATTERNS = ["config.json", "model-*.safetensors", "model.safetensors.index.json", "tokenizer.json",
+                       "README.md"]
 
 
 def say(message: str) -> None:
@@ -230,13 +232,21 @@ def jina_requirements(gpu: GpuConfig) -> list[str]:
     return _optional("jina-cuda" if gpu.provider == "cuda" else "jina")
 
 
-def torch_requirements(cfg: Config) -> list[str]:
-    """PyTorch-based extras for the enabled features: the jina reranker and/or JEV-9B (one torch build)."""
+def code_requirements(gpu: GpuConfig) -> list[str]:
+    """cocoindex-code plus PyTorch for bge-code-v1 (CUDA build and bitsandbytes on an NVIDIA GPU)."""
+    return _optional("code") + _optional("code-embed-cuda" if gpu.provider == "cuda" else "code-embed")
+
+
+def extra_requirements(cfg: Config) -> list[str]:
+    """Optional extras for the enabled features, installed in one pip run so they share one torch build:
+    the jina reranker, JEV-9B and/or code search."""
     deps: list[str] = []
     if cfg.rerank.enabled and cfg.rerank.backend == "jina":
         deps += jina_requirements(cfg.gpu)
     if cfg.jev.enabled:
         deps += _optional("jev")
+    if cfg.code_search.enabled:
+        deps += code_requirements(cfg.gpu)
     return list(dict.fromkeys(deps))
 
 
@@ -259,18 +269,19 @@ def _installed(package: str) -> str | None:
         return None
 
 
-def ensure_torch_dependencies(cfg: Config) -> None:
-    deps = torch_requirements(cfg)
+def ensure_extra_dependencies(cfg: Config) -> None:
+    deps = extra_requirements(cfg)
     if not deps:
         return
     if sys.platform == "win32" and platform.machine().upper() != "AMD64":
-        raise RuntimeError("PyTorch has no Windows ARM64 wheel; use [rerank] backend = \"bge\" and [jev] enabled = false.")
+        raise RuntimeError("PyTorch has no Windows ARM64 wheel; use [rerank] backend = \"bge\", [jev] enabled = false "
+                           "and [code_search] enabled = false.")
     marker = Path(sys.executable).resolve().parent / ".deps-torch"
     digest = hashlib.sha256("\n".join(sorted(deps)).encode()).hexdigest()
     if marker.exists() and marker.read_text() == digest:
         return
     wanted = _wanted_torch(deps)
-    say("Installing PyTorch extras: " + ", ".join(d.split(" @ ")[0] for d in deps)
+    say("Installing optional extras: " + ", ".join(d.split(" @ ")[0] for d in deps)
         + (" (CUDA build of torch, about 2 GB)" if wanted and "+cu" in wanted and _installed("torch") != wanted else ""))
     env = os.environ.copy()
     env["PIP_CACHE_DIR"] = str(paths.CACHE_DIR / "pip")
@@ -281,9 +292,19 @@ def ensure_torch_dependencies(cfg: Config) -> None:
     _run(
         [sys.executable, "-m", "pip", "install", "--no-warn-script-location", "--only-binary=:all:", *deps],
         env,
-        "pip install (PyTorch extras)",
+        "pip install (optional extras)",
     )
     marker.write_text(digest)
+
+
+def ensure_code_search(cfg: Config) -> None:
+    code = cfg.code_search
+    if not code.enabled:
+        return
+    # tokenizer.json only: the repo's tokenization_qwen.py (remote code) is not needed, see code_embedding_server.
+    _snapshot(code.model_repo, code.revision, CODE_MODEL_PATTERNS, f"{code.model_repo} (about 6.2 GB, Apache-2.0)")
+    for d in (paths.CODE_REPOS_DIR, paths.CODE_INDEX_DIR, paths.CODE_CCC_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 
 def _jev_mcp_dir() -> Path:
@@ -350,7 +371,8 @@ def ensure_all(cfg: Config) -> None:
     ensure_docs_mcp(cfg)
     ensure_browser(cfg)
     ensure_model(cfg)
-    ensure_torch_dependencies(cfg)
+    ensure_extra_dependencies(cfg)
     ensure_rerank(cfg)
     ensure_jev(cfg)
+    ensure_code_search(cfg)
     say("Everything is installed.")

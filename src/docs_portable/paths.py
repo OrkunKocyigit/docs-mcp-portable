@@ -21,6 +21,10 @@ STORE_DIR = DATA_DIR / "store"  # documents.db
 APPDATA_DIR = DATA_DIR / "appdata" / "Roaming"  # redirected %APPDATA% (docs-mcp-server config.yaml)
 LOCALAPPDATA_DIR = DATA_DIR / "appdata" / "Local"
 DOWNLOADS_DIR = CACHE_DIR / "downloads"
+CODE_DIR = DATA_DIR / "code"  # Code page: project list, clones, cocoindex-code settings and indexes
+CODE_REPOS_DIR = CODE_DIR / "repos"  # git clones, <host>/<owner>/<repo>
+CODE_INDEX_DIR = CODE_DIR / "index"  # cocoindex-code databases (COCOINDEX_CODE_DB_PATH_MAPPING)
+CODE_CCC_DIR = CODE_DIR / "ccc"  # COCOINDEX_CODE_DIR: global_settings.yml, daemon log/pid
 
 NODE_EXE = NODE_DIR / "node.exe"
 NPM_CLI = NODE_DIR / "node_modules" / "npm" / "bin" / "npm-cli.js"

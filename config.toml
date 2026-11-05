@@ -111,6 +111,36 @@ mcp_version = "0.14.7"
 request_timeout_ms = 600000
 access_log = false
 
+[code_search]
+# Code page (http://<host>:<port>) to add local folders or git repositories, index them with cocoindex-code
+# (Apache-2.0) and search them; read-only MCP endpoint at /mcp (list_projects, search_code).
+# Embeddings: BAAI/bge-code-v1 (Apache-2.0, 1.5B parameters) on PyTorch from a local endpoint (embed_port).
+# The next start installs cocoindex-code + PyTorch (CUDA build with [gpu] provider = "cuda") and downloads
+# the model (~6.2 GB). Indexes, clones and settings stay in runtime\data\code.
+enabled = true
+host = "127.0.0.1"
+port = 6290
+embed_host = "127.0.0.1"
+embed_port = 8084
+# Weights on an NVIDIA GPU: "int8" (~2 GB VRAM), "nf4" (~1.2 GB) or "fp16" (~3.5 GB). CPU: float32.
+quantization = "int8"
+# Git hosts the Code page may clone from (https only). Add self-hosted GitLab/Gitea hosts here.
+git_hosts = ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"]
+# git clone/pull gives up after this many seconds.
+clone_timeout_s = 1800
+# Files larger than this are skipped when indexing.
+max_file_size_kb = 1024
+access_log = false
+
+# Cost limits per device (texts per forward pass, tokens per chunk).
+[code_search.cpu]
+batch_size = 4
+max_length = 1024
+
+[code_search.gpu]
+batch_size = 8
+max_length = 1024
+
 [docs_mcp]
 package = "@arabold/docs-mcp-server"
 # Pinned npm version. Use "latest" to always take the newest release.

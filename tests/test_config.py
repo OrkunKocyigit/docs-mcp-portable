@@ -157,6 +157,57 @@ class RerankConfigTest(unittest.TestCase):
             parse_config({"rerank": {"depth": 10}})
 
 
+class CodeSearchConfigTest(unittest.TestCase):
+    def test_disabled_by_default_with_loopback_urls(self):
+        code = parse_config({}).code_search
+        self.assertFalse(code.enabled)
+        self.assertEqual(code.url, "http://127.0.0.1:6290")
+        self.assertEqual(code.embed_base_url, "http://127.0.0.1:8084/v1")
+        self.assertEqual(code.quantization, "int8")
+        self.assertIn("github.com", code.git_hosts)
+
+    def test_limits_follow_device(self):
+        code = parse_config({"code_search": {"gpu": {"batch_size": 2}}}).code_search
+        self.assertEqual((code.limits("cuda").batch_size, code.limits("cuda").max_length), (2, 1024))
+        self.assertEqual(code.limits("cpu").batch_size, 4)
+
+    def test_rejects_invalid_values(self):
+        for code in (
+            {"host": "0.0.0.0"},
+            {"embed_host": "192.168.1.2"},
+            {"quantization": "fp8"},
+            {"revision": "main"},
+            {"model_name": "bge code"},
+            {"query_instruction": ""},
+            {"query_instruction": "x" * 501},
+            {"port": 8084},
+            {"port": "6290"},
+            {"embed_port": 0},
+            {"clone_timeout_s": 5},
+            {"max_file_size_kb": 0},
+            {"enabled": "yes"},
+            {"git_hosts": "github.com"},
+            {"git_hosts": ["https://github.com"]},
+            {"git_hosts": ["github.com:8443"]},
+            {"git_hosts": ["GitHub.com"]},
+            {"git_hosts": ["10.0.0.5"]},
+            {"git_hosts": ["localhost"]},
+            {"git_hosts": ["intranet"]},
+            {"git_hosts": [1]},
+            {"cpu": {"batch_size": 0}},
+            {"gpu": {"max_length": 9000}},
+            {"batch_size": 4},
+            {"unknown": 1},
+        ):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                parse_config({"code_search": code})
+
+    def test_custom_git_hosts(self):
+        code = parse_config({"code_search": {"git_hosts": ["git.example.com"]}}).code_search
+        self.assertEqual(code.git_hosts, ["git.example.com"])
+        self.assertIn("github.com", parse_config({}).code_search.git_hosts)
+
+
 class GpuConfigTest(unittest.TestCase):
     def test_default_is_cpu(self):
         cfg = parse_config({})
