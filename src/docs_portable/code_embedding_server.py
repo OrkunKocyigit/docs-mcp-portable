@@ -12,6 +12,7 @@ sequence (add_eos_token), which ``prepare_ids`` reproduces. Embeddings are the l
 from __future__ import annotations
 
 import base64
+import dataclasses
 import logging
 import threading
 import time
@@ -23,7 +24,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import paths, quantization
+from . import cpu, paths, quantization
 from .config import CodeSearchConfig, GpuConfig, load_config
 
 log = logging.getLogger("code-embed")
@@ -200,7 +201,7 @@ def create_app(cfg: CodeSearchConfig, gpu: GpuConfig, encoder_factory=load_encod
 
 def main() -> None:
     full = load_config()
-    cfg = full.code_search
+    cfg = dataclasses.replace(full.code_search, threads=cpu.thread_plan(full)["code"])
     logging.basicConfig(level=logging.INFO, format="[code-embed] %(message)s")
     uvicorn.run(create_app(cfg, full.gpu), host=cfg.embed_host, port=cfg.embed_port, log_level="info",
                 access_log=cfg.access_log)

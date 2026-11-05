@@ -21,7 +21,8 @@ model_repo = "BAAI/bge-m3"
 model_name = "bge-m3"
 host = "127.0.0.1"
 port = 8081
-# CPU threads for inference, 0 = onnxruntime default.
+# CPU threads for inference. 0 = automatic: all physical cores, or half of them when code search also runs on
+# the CPU (see README "Sharing the CPU").
 threads = 0
 # Weight quantization: "int8" (CPU only; on a GPU it is not applied and a warning is printed), "nf4" (CPU and
 # CUDA, 4-bit) or "none". Quantized files are built once by `start.bat setup`. Changing it changes the
@@ -64,7 +65,7 @@ quantization = "int8"
 # "auto" = follow `quantization`. Or name one file, which then ignores `quantization`:
 # onnx/model_int8.onnx, onnx/model_fp16.onnx, onnx/model.onnx (fp32, 2.3 GB).
 bge_onnx_file = "auto"
-# Pairs per ONNX forward pass (bge) and CPU threads (0 = default).
+# Pairs per ONNX forward pass (bge) and CPU threads (0 = automatic, as in [embedding]).
 batch_size = 8
 threads = 0
 access_log = false

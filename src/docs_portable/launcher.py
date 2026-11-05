@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from ctypes import wintypes
 
-from . import installer, paths
+from . import cpu, installer, paths
 from .config import Config
 from .jev_protocol import TOKEN_ENV as JEV_TOKEN_ENV
 
@@ -200,6 +200,16 @@ def _start_code_search(cfg: Config) -> tuple[subprocess.Popen, subprocess.Popen]
         raise RuntimeError(f"Code search did not start: {exc}") from exc
 
 
+def cpu_sharing_note(cfg: Config) -> str | None:
+    """One line describing the automatic CPU split, when there is one."""
+    if not cpu.shares_cpu(cfg):
+        return None
+    plan = cpu.thread_plan(cfg)
+    return (f"[run] CPU shared by docs search and code search: {plan['embedding']} threads for embedding/rerank, "
+            f"{plan['code']} for {cfg.code_search.model_name} ({cpu.physical_cores()} physical cores; "
+            "set threads in config.toml to override)")
+
+
 def _rerank_device(cfg: Config) -> str:
     """Device of a running rerank server, else the one config.toml asks for."""
     rr = cfg.rerank
@@ -331,6 +341,9 @@ def run(cfg: Config) -> int:
     code_page: subprocess.Popen | None = None
     jev_token = secrets.token_urlsafe(32)
     try:
+        note = cpu_sharing_note(cfg)
+        if note:
+            print(note, flush=True)
         print("[run] Starting embedding server...", flush=True)
         embed = subprocess.Popen([sys.executable, "-m", "docs_portable.embedding_server"], env=_model_env())
         if rr.enabled:

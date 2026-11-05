@@ -6,6 +6,7 @@ jinaai/jina-reranker-v3.5 on torch + transformers.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import threading
@@ -18,7 +19,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import paths, quantization
+from . import cpu, paths, quantization
 from .config import GpuConfig, RerankConfig, load_config
 
 log = logging.getLogger("rerank")
@@ -196,7 +197,7 @@ def create_app(cfg: RerankConfig, gpu: GpuConfig, scorer_factory=load_scorer) ->
 
 def main() -> None:
     full = load_config()
-    cfg = full.rerank
+    cfg = dataclasses.replace(full.rerank, threads=cpu.thread_plan(full)["rerank"])
     logging.basicConfig(level=logging.INFO, format="[rerank] %(message)s")
     uvicorn.run(create_app(cfg, full.gpu), host=cfg.host, port=cfg.port, log_level="info", access_log=cfg.access_log)
 

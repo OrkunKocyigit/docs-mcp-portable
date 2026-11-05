@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
-from . import paths, quantization
+from . import cpu, paths, quantization
 from .config import EmbeddingConfig, GpuConfig, load_config
 from .onnx_session import create_session, device_name, run_options
 
@@ -125,7 +126,7 @@ def create_app(cfg: EmbeddingConfig, gpu: GpuConfig) -> FastAPI:
 
 def main() -> None:
     full = load_config()
-    cfg = full.embedding
+    cfg = dataclasses.replace(full.embedding, threads=cpu.thread_plan(full)["embedding"])
     logging.basicConfig(level=logging.INFO, format="[embed] %(message)s")
     uvicorn.run(
         create_app(cfg, full.gpu),

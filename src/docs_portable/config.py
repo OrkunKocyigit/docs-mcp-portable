@@ -86,6 +86,8 @@ class EmbeddingConfig:
 
     def validate(self) -> None:
         _check_quantization("embedding", self.quantization)
+        if isinstance(self.threads, bool) or not isinstance(self.threads, int) or not 0 <= self.threads <= 1024:
+            raise ValueError("config.toml: [embedding] threads must be an integer between 0 and 1024")
         self.cpu.validate("embedding.cpu")
         self.gpu.validate("embedding.gpu")
 

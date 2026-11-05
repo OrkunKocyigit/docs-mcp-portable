@@ -165,9 +165,15 @@ extra docs-mcp-server flags and environment variables such as `GITHUB_TOKEN`). N
   incompatible. Re-scrape with `--replace` afterwards.
 - **No GPU needed.** Embeddings run on the CPU by default (`onnxruntime`, no PyTorch/CUDA). Expect roughly 3 GB of RAM
   for the model and slower indexing than on a GPU (queries are fast; a large docs site can take a while to index).
-  Tune `threads` (CPU threads, `0` = all cores) and, per device, `batch_size`/`max_length` in `[embedding.cpu]` and
+  Tune `threads` (CPU threads, `0` = automatic) and, per device, `batch_size`/`max_length` in `[embedding.cpu]` and
   `[embedding.gpu]`. The GPU defaults (2 texts, 2048 tokens) are small on purpose: on Windows a GPU that runs out of
   memory does not fail, it silently spills into system RAM and indexing becomes many times slower.
+- **Sharing the CPU.** The model servers never let idle threads spin, so a busy server does not slow down another
+  (measured: two onnxruntime servers using all cores ran 2.6x slower than one after the other with spinning on).
+  With `threads = 0`, each server uses all physical cores, except when code search also runs on the CPU
+  (`[code_search] enabled = true` and `[gpu] provider = "none"`): then bge-code-v1 gets half the cores and the
+  embedding/rerank servers the other half, so code indexing and docs search can run together. The launcher prints
+  the split; a `threads` value in `[embedding]`, `[rerank]` or `[code_search]` overrides it for that server.
 
 ### GPU
 
