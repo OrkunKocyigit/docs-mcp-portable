@@ -18,7 +18,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import paths
+from . import paths, quantization
 from .config import GpuConfig, RerankConfig, load_config
 
 log = logging.getLogger("rerank")
@@ -43,9 +43,11 @@ class BgeReranker:
         from .onnx_session import create_session, device_name, run_options
 
         model_dir = paths.model_dir(cfg.bge_repo)
-        onnx_path = model_dir / cfg.bge_file(gpu)
+        plan = quantization.rerank_plan(cfg.quantization, gpu.provider, cfg.bge_onnx_file,
+                                        quantization.local_onnx_files(model_dir))
+        onnx_path, self.precision = quantization.resolve_onnx(model_dir, plan, log)
         if not onnx_path.exists():
-            raise SystemExit(f"Reranker model not found at {onnx_path}. Run the launcher once to download it.")
+            raise SystemExit(f"Reranker model not found at {onnx_path}. Run `start.bat setup` to download it.")
 
         self.session = create_session(onnx_path, gpu, cfg.threads, "rerank")
         self.device = device_name(self.session)
@@ -112,15 +114,22 @@ class JinaReranker:
         self.device = "cuda" if device != "cpu" else "cpu"
 
         started = time.perf_counter()
-        # trust_remote_code runs modeling.py from the local snapshot pinned to cfg.jina_revision.
-        self.model = AutoModel.from_pretrained(
-            str(model_dir),
-            dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-            trust_remote_code=True,
-            local_files_only=True,
-        ).to(device)
-        self.model.eval()
-        log.info("Loaded %s@%s on %s in %.1fs", cfg.jina_repo, cfg.jina_revision[:7], device,
+        cuda = self.device == "cuda"
+        dtype = torch.bfloat16 if cuda else torch.float32
+
+        def load(quantization_config):
+            # trust_remote_code runs modeling.py from the local snapshot pinned to cfg.jina_revision.
+            kwargs = {"dtype": dtype, "trust_remote_code": True, "local_files_only": True}
+            if quantization_config is not None:
+                model = AutoModel.from_pretrained(str(model_dir), quantization_config=quantization_config,
+                                                  device_map={"": gpu.device_id}, **kwargs)
+            else:
+                model = AutoModel.from_pretrained(str(model_dir), **kwargs).to(device)
+            return model.eval()
+
+        self.model, self.precision = quantization.load_torch(load, cfg.quantization, cuda, dtype, log,
+                                                             "jina-reranker-v3.5")
+        log.info("Loaded %s@%s on %s (%s) in %.1fs", cfg.jina_repo, cfg.jina_revision[:7], device, self.precision,
                  time.perf_counter() - started)
 
     def score(self, query: str, documents: list[str]) -> list[float]:
@@ -173,7 +182,9 @@ def create_app(cfg: RerankConfig, gpu: GpuConfig, scorer_factory=load_scorer) ->
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "model": cfg.model_name, "device": state["scorer"].device}
+        scorer = state["scorer"]
+        return {"status": "ok", "model": cfg.model_name, "device": scorer.device,
+                "precision": getattr(scorer, "precision", "fp32")}
 
     @app.post("/v1/rerank")
     def rerank(req: RerankRequest) -> dict:

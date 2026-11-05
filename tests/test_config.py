@@ -232,15 +232,30 @@ class GpuConfigTest(unittest.TestCase):
             with self.subTest(section=section), self.assertRaisesRegex(ValueError, r"\[gpu\]"):
                 parse_config({section: {"providers": ["DmlExecutionProvider"]}})
 
-    def test_bge_file_auto_follows_gpu(self):
-        cpu = parse_config({})
-        self.assertEqual(cpu.rerank.bge_file(cpu.gpu), "onnx/model_int8.onnx")
-        gpu = parse_config({"gpu": {"provider": "cuda"}})
-        self.assertEqual(gpu.rerank.bge_file(gpu.gpu), "onnx/model_fp16.onnx")
+    def test_rejects_unsafe_bge_onnx_file(self):
+        for value in ("../model.onnx", "onnx/../../x.onnx", "C:\\model.onnx", "/abs.onnx", "model.bin", 5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "bge_onnx_file"):
+                parse_config({"rerank": {"bge_onnx_file": value}})
 
-    def test_explicit_bge_file_wins(self):
-        cfg = parse_config({"gpu": {"provider": "directml"}, "rerank": {"bge_onnx_file": "onnx/model.onnx"}})
-        self.assertEqual(cfg.rerank.bge_file(cfg.gpu), "onnx/model.onnx")
+
+class QuantizationConfigTest(unittest.TestCase):
+    def test_int8_is_the_default_everywhere(self):
+        cfg = parse_config({})
+        self.assertEqual((cfg.embedding.quantization, cfg.rerank.quantization, cfg.code_search.quantization,
+                          cfg.jev.quantization), ("int8", "int8", "int8", "int8"))
+
+    def test_accepts_levels(self):
+        for section in ("embedding", "rerank", "code_search"):
+            for level in ("none", "int8", "nf4"):
+                with self.subTest(section=section, level=level):
+                    cfg = parse_config({section: {"quantization": level}})
+                    self.assertEqual(getattr(cfg, section).quantization, level)
+
+    def test_rejects_unknown_levels(self):
+        for section in ("embedding", "rerank", "code_search"):
+            for level in ("fp16", "nvfp4", "INT8", "q4", "", None, 8):
+                with self.subTest(section=section, level=level), self.assertRaisesRegex(ValueError, "quantization"):
+                    parse_config({section: {"quantization": level}})
 
 
 if __name__ == "__main__":

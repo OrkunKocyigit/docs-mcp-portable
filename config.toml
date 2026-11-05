@@ -23,6 +23,10 @@ host = "127.0.0.1"
 port = 8081
 # CPU threads for inference, 0 = onnxruntime default.
 threads = 0
+# Weight quantization: "int8" (CPU only; on a GPU it is not applied and a warning is printed), "nf4" (CPU and
+# CUDA, 4-bit) or "none". Quantized files are built once by `start.bat setup`. Changing it changes the
+# vectors slightly: re-scrape libraries for best results.
+quantization = "int8"
 # Log every /v1/embeddings request.
 access_log = false
 
@@ -52,8 +56,13 @@ backend = "bge"
 accept_noncommercial_license = true
 host = "127.0.0.1"
 port = 8082
-# bge ONNX variant. "auto" = onnx/model_fp16.onnx (1.1 GB) on a GPU, onnx/model_int8.onnx (570 MB) on the
-# CPU. Or name one: onnx/model_int8.onnx, onnx/model_fp16.onnx, onnx/model.onnx (fp32, 2.3 GB).
+# Weight quantization for either backend: "int8", "nf4" or "none".
+#   bge  (ONNX): int8 on the CPU (model_int8.onnx, 570 MB); on a GPU int8 is not applied (warning) and the
+#                fp16 file (1.1 GB) is used; nf4 is built once from the fp32 model (CPU and CUDA).
+#   jina (PyTorch): int8 / nf4 via bitsandbytes on CUDA, int8 also on the CPU.
+quantization = "int8"
+# "auto" = follow `quantization`. Or name one file, which then ignores `quantization`:
+# onnx/model_int8.onnx, onnx/model_fp16.onnx, onnx/model.onnx (fp32, 2.3 GB).
 bge_onnx_file = "auto"
 # Pairs per ONNX forward pass (bge) and CPU threads (0 = default).
 batch_size = 8
@@ -122,7 +131,8 @@ host = "127.0.0.1"
 port = 6290
 embed_host = "127.0.0.1"
 embed_port = 8084
-# Weights on an NVIDIA GPU: "int8" (~2 GB VRAM), "nf4" (~1.2 GB) or "fp16" (~3.5 GB). CPU: float32.
+# "int8" (GPU ~2 GB VRAM via bitsandbytes; CPU dynamic int8), "nf4" (GPU only, ~1.2 GB) or
+# "none" (fp16 ~3.5 GB on a GPU, float32 on the CPU).
 quantization = "int8"
 # Git hosts the Code page may clone from (https only). Add self-hosted GitLab/Gitea hosts here.
 git_hosts = ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"]

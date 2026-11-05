@@ -113,7 +113,8 @@ class HttpTest(unittest.TestCase):
 
     def test_health(self):
         with urllib.request.urlopen(f"{self.srv.base}/health", timeout=10) as r:
-            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-code-v1", "device": "cpu", "dimensions": 4})
+            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-code-v1", "device": "cpu", "dimensions": 4,
+                                            "precision": "fp32"})
 
     def test_queries_get_the_instruction_and_documents_do_not(self):
         for input_type, expected in (("query", "<instruct>Q.\n<query>fn x"), ("search_query", "<instruct>Q.\n<query>fn x"),

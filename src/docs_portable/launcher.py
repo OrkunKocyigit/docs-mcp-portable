@@ -118,14 +118,40 @@ def _smoke_test(cfg: Config) -> None:
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         dim = len(json.load(r)["data"][0]["embedding"])
-    device = _device(f"http://{cfg.embedding.host}:{cfg.embedding.port}/health")
-    print(f"[run] Embedding endpoint ready: {cfg.embedding.base_url} ({cfg.embedding.model_name}, {dim} dims, {device})",
-          flush=True)
+    health = _health(f"http://{cfg.embedding.host}:{cfg.embedding.port}/health")
+    device, precision = str(health.get("device", "cpu")), str(health.get("precision", "fp32"))
+    print(f"[run] Embedding endpoint ready: {cfg.embedding.base_url} ({cfg.embedding.model_name}, {dim} dims, "
+          f"{device}, {precision})", flush=True)
+    note_embedding_precision(cfg.embedding.model_name, precision)
+
+
+def note_embedding_precision(model_name: str, precision: str) -> str | None:
+    """Warn once when the docs index was built with other embedding weights (vectors differ slightly)."""
+    current = f"{model_name}:{precision}"
+    marker = paths.STORE_DIR / "embedding-precision.txt"
+    if marker.exists():
+        previous = marker.read_text(encoding="utf-8").strip()
+    else:
+        # Indexes from before quantization support were built with the full-precision (fp32) ONNX model.
+        previous = f"{model_name}:fp32" if (paths.STORE_DIR / "documents.db").exists() else None
+    warning = None
+    if previous and previous != current:
+        warning = (f"[run] Note: the embedding model changed from {previous} to {current}. Documents indexed before "
+                   "keep their old vectors; re-scrape libraries (start.bat cli scrape ... --replace) for best results.")
+        print(warning, file=sys.stderr, flush=True)
+    if previous != current:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(current, encoding="utf-8")
+    return warning
+
+
+def _health(health_url: str) -> dict:
+    with urllib.request.urlopen(health_url, timeout=10) as r:
+        return json.load(r)
 
 
 def _device(health_url: str) -> str:
-    with urllib.request.urlopen(health_url, timeout=10) as r:
-        return str(json.load(r).get("device", "cpu"))
+    return str(_health(health_url).get("device", "cpu"))
 
 
 def _smoke_test_rerank(cfg: Config) -> str:
@@ -136,10 +162,11 @@ def _smoke_test_rerank(cfg: Config) -> str:
         results = json.load(r)["results"]
     if len(results) != 2:
         raise RuntimeError("Rerank endpoint returned an unexpected response")
-    device = _device(f"http://{rr.host}:{rr.port}/health")
+    health = _health(f"http://{rr.host}:{rr.port}/health")
+    device = str(health.get("device", "cpu"))
     limits = rr.limits(device)
-    print(f"[run] Rerank endpoint ready: {rr.url} ({rr.model_name}, {device}: top {limits.candidates} candidates, "
-          f"timeout {limits.timeout_ms} ms)", flush=True)
+    print(f"[run] Rerank endpoint ready: {rr.url} ({rr.model_name}, {device}, {health.get('precision', 'fp32')}: "
+          f"top {limits.candidates} candidates, timeout {limits.timeout_ms} ms)", flush=True)
     return device
 
 
@@ -149,9 +176,9 @@ def _smoke_test_code(cfg: Config) -> None:
     req = urllib.request.Request(f"{code.embed_base_url}/embeddings", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as r:
         dim = len(json.load(r)["data"][0]["embedding"])
-    device = _device(f"http://{code.embed_host}:{code.embed_port}/health")
-    print(f"[run] Code embedding endpoint ready: {code.embed_base_url} ({code.model_name}, {dim} dims, {device})",
-          flush=True)
+    health = _health(f"http://{code.embed_host}:{code.embed_port}/health")
+    print(f"[run] Code embedding endpoint ready: {code.embed_base_url} ({code.model_name}, {dim} dims, "
+          f"{health.get('device', 'cpu')}, {health.get('precision', 'fp32')})", flush=True)
 
 
 def _start_code_search(cfg: Config) -> tuple[subprocess.Popen, subprocess.Popen]:
@@ -159,7 +186,7 @@ def _start_code_search(cfg: Config) -> tuple[subprocess.Popen, subprocess.Popen]
     code = cfg.code_search
     embed = service = None
     try:
-        print(f"[run] Loading {code.model_name} ({code.quantization} on a GPU)...", flush=True)
+        print(f"[run] Loading {code.model_name} (quantization: {code.quantization})...", flush=True)
         embed = subprocess.Popen([sys.executable, "-m", "docs_portable.code_embedding_server"], env=_model_env())
         _wait_healthy(f"http://{code.embed_host}:{code.embed_port}/health", embed, "Code embedding server")
         _smoke_test_code(cfg)

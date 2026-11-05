@@ -115,6 +115,30 @@ by the local `/v1/rerank` endpoint first, before grouping and context assembly.
   full-text candidates; `DOCS_MCP_SEARCH_OVERFETCH_FACTOR` in `[docs_mcp.env]` widens that pool.
 - Reranking applies to hybrid search; it is skipped when docs-mcp-server runs without embeddings.
 
+### Quantization
+
+Every model has a `quantization` setting (`[embedding]`, `[rerank]`, `[code_search]`, `[jev]`); the default is
+`"int8"`. `"nf4"` (4-bit) uses the least memory, `"none"` loads the model's normal precision. A level the model,
+runtime or device cannot do is **not applied**: the model loads normally and the server prints a warning at start-up.
+
+| Model (runtime) | `int8` | `nf4` |
+|---|---|---|
+| bge-m3, bge-reranker (ONNX) | CPU only (dynamic int8 MatMul/Gather) | CPU and CUDA (`MatMulBnb4`) |
+| jina-reranker, bge-code-v1 (PyTorch) | CUDA (bitsandbytes) and CPU (dynamic int8 `Linear`) | CUDA only |
+| JEV-9B (PyTorch, CUDA) | yes | yes (its third choice is `"bf16"`) |
+
+- ONNX: onnxruntime runs int8 on NVIDIA GPUs only through TensorRT, so on CUDA/DirectML `int8` keeps the full model
+  (fp32 for bge-m3, the fp16 file for the reranker). `nf4` has no DirectML kernels. A repository's own
+  `model_int8.onnx` / `model_quantized.onnx` is used when it has one; otherwise `start.bat setup` builds
+  `onnx/model.int8.onnx` or `onnx/model.nf4.onnx` from the fp32 model once (a few minutes, several GB of RAM).
+  The vocabulary table stays in full precision under nf4, so XLM-R models shrink less than with int8.
+- Measured on bge-m3 against fp32 (cosine similarity of the vectors, CPU): int8 0.98 (2.3 GB -> 540 MB), nf4 0.97
+  (-> 1.2 GB).
+- Changing the embedding precision changes the vectors slightly. The launcher remembers the precision the docs index
+  was built with and prints a one-time note to re-scrape when it changes; search keeps working meanwhile.
+- PyTorch int8 on the CPU uses `torch.ao.quantization`, which PyTorch has deprecated in favour of torchao but still
+  ships; if a later PyTorch drops it, the model runs unquantized with a warning.
+
 ### jina-reranker-v3.5 (non-commercial only)
 
 jina-reranker-v3.5 is licensed **CC BY-NC 4.0**: personal, non-commercial projects only. It has no ONNX export,
@@ -156,7 +180,7 @@ device_id = 0          # which GPU, if there are several
 ```
 
 The next `start.bat` swaps in the matching onnxruntime build (`[project.optional-dependencies]` in `pyproject.toml`)
-and, for bge, downloads the fp16 reranker instead of int8 (`bge_onnx_file = "auto"`). The launcher prints where each
+and, for bge, downloads the fp16 reranker instead of int8 (see [Quantization](#quantization)). The launcher prints where each
 model runs (`cpu`, `cuda` or `directml`); if the GPU is not usable it says so and continues on the CPU.
 
 | provider | Package | Extra download | Notes |
@@ -216,7 +240,7 @@ already up; then the launcher prints where its layers went and starts jev-mcp:
 ```toml
 [code_search]
 enabled = true
-quantization = "int8"   # on an NVIDIA GPU: "int8" (~2 GB VRAM), "nf4" or "fp16"; float32 on the CPU
+quantization = "int8"   # GPU: "int8" (~2 GB VRAM), "nf4" or "none" (fp16); CPU: "int8" or "none" (float32)
 ```
 
 The next start installs cocoindex-code and PyTorch (pinned under `[project.optional-dependencies] code` /
@@ -261,7 +285,8 @@ Code search is optional like JEV: if it cannot start, docs search keeps running.
 ## Licenses
 
 This project is MIT licensed. It downloads, at runtime, docs-mcp-server (MIT), BGE-M3 (MIT), bge-reranker-v2-m3
-(Apache-2.0), Node.js (MIT), Python (PSF), pip (MIT) and Chromium via Playwright (BSD-style/Apache-2.0); each keeps
+(Apache-2.0), Node.js (MIT), Python (PSF), pip (MIT), onnx (Apache-2.0) and Chromium via Playwright
+(BSD-style/Apache-2.0); each keeps
 its own license. Only when explicitly enabled: jina-reranker-v3.5 (**CC BY-NC 4.0, non-commercial**), PyTorch
 (BSD-3-Clause) and transformers (Apache-2.0); with `[gpu]`: onnxruntime-gpu / onnxruntime-directml (MIT) and the
 NVIDIA CUDA/cuDNN runtime wheels (NVIDIA software license); with `[jev]`: autotrust/JEV-9B and its base Qwen3.5-9B

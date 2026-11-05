@@ -18,7 +18,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import docs_mcp_patch, paths
+from . import docs_mcp_patch, paths, quantization
 from .config import Config, GpuConfig
 
 USER_AGENT = "docs-portable/0.1 (+https://github.com/arabold/docs-mcp-server)"
@@ -190,21 +190,45 @@ def ensure_browser(cfg: Config) -> None:
 def ensure_model(cfg: Config) -> Path:
     target = paths.model_dir(cfg.embedding.model_repo)
     marker = target / ".complete"
-    if marker.exists() and (target / "onnx" / "model.onnx").exists():
-        return target
-    say(f"Downloading {cfg.embedding.model_repo} (ONNX, about 2.3 GB, resumable)")
+    if not (marker.exists() and (target / "onnx" / "model.onnx").exists()):
+        say(f"Downloading {cfg.embedding.model_repo} (ONNX, about 2.3 GB, resumable)")
+        os.environ.setdefault("HF_HOME", str(paths.CACHE_DIR / "hf"))
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        from huggingface_hub import snapshot_download
+
+        target.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=cfg.embedding.model_repo,
+            local_dir=target,
+            allow_patterns=MODEL_PATTERNS,
+        )
+        marker.write_text("ok")
+    plan = quantization.embedding_plan(cfg.embedding.quantization, cfg.gpu.provider,
+                                       quantization.local_onnx_files(target))
+    _build_quantized(target, plan, cfg.embedding.model_name)
+    return target
+
+
+def _build_quantized(model_dir: Path, plan: quantization.OnnxPlan, label: str) -> None:
+    if not plan.build_from or (model_dir / plan.file).exists():
+        return
+    say(f"Quantizing {label} to {plan.build_level} (one-time, a few minutes and several GB of RAM)")
+    quantization.build_onnx(model_dir / plan.build_from, model_dir / plan.file, plan.build_level)
+
+
+def _repo_files(repo: str, revision: str) -> set[str]:
+    """File list of a pinned repository revision, cached next to the model (no network on later starts)."""
+    cache = paths.model_dir(repo) / f".files-{revision}.json"
+    if cache.exists():
+        return set(json.loads(cache.read_text(encoding="utf-8")))
     os.environ.setdefault("HF_HOME", str(paths.CACHE_DIR / "hf"))
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import list_repo_files
 
-    target.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=cfg.embedding.model_repo,
-        local_dir=target,
-        allow_patterns=MODEL_PATTERNS,
-    )
-    marker.write_text("ok")
-    return target
+    files = sorted(list_repo_files(repo, revision=revision))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(files), encoding="utf-8")
+    return set(files)
 
 
 def _snapshot(repo: str, revision: str, patterns: list[str], label: str) -> None:
@@ -347,9 +371,12 @@ def ensure_rerank(cfg: Config) -> None:
     if not rr.enabled:
         return
     if rr.backend == "bge":
-        onnx_file = rr.bge_file(cfg.gpu)
-        _snapshot(rr.bge_repo, rr.bge_revision, [onnx_file, "tokenizer.json", "config.json", "README.md"],
-                  f"{rr.bge_repo} ({onnx_file})")
+        available = _repo_files(rr.bge_repo, rr.bge_revision)
+        plan = quantization.rerank_plan(rr.quantization, cfg.gpu.provider, rr.bge_onnx_file, available)
+        files = quantization.download_patterns(plan, available)
+        _snapshot(rr.bge_repo, rr.bge_revision, [*files, "tokenizer.json", "config.json", "README.md"],
+                  f"{rr.bge_repo} ({', '.join(f for f in files if f.endswith('.onnx'))})")
+        _build_quantized(paths.model_dir(rr.bge_repo), plan, rr.model_name)
     else:
         _snapshot(rr.jina_repo, rr.jina_revision, JINA_PATTERNS, f"{rr.jina_repo} (about 1.2 GB, CC BY-NC 4.0)")
 

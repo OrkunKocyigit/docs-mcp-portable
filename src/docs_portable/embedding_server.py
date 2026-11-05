@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
-from . import paths
+from . import paths, quantization
 from .config import EmbeddingConfig, GpuConfig, load_config
 from .onnx_session import create_session, device_name, run_options
 
@@ -23,11 +23,14 @@ HIDDEN_SIZE = 1024
 
 class Embedder:
     def __init__(self, cfg: EmbeddingConfig, gpu: GpuConfig) -> None:
-        onnx_dir = paths.model_dir(cfg.model_repo) / "onnx"
-        if not (onnx_dir / "model.onnx").exists():
+        model_dir = paths.model_dir(cfg.model_repo)
+        onnx_dir = model_dir / "onnx"
+        plan = quantization.embedding_plan(cfg.quantization, gpu.provider, quantization.local_onnx_files(model_dir))
+        model_path, self.precision = quantization.resolve_onnx(model_dir, plan, logging.getLogger("embedding"))
+        if not model_path.exists():
             raise SystemExit(f"Model not found in {onnx_dir}. Run the launcher once to download it.")
 
-        self.session = create_session(onnx_dir / "model.onnx", gpu, cfg.threads, "embedding")
+        self.session = create_session(model_path, gpu, cfg.threads, "embedding")
         self.device = device_name(self.session)
         self._run_options = run_options(gpu)
 
@@ -88,7 +91,9 @@ def create_app(cfg: EmbeddingConfig, gpu: GpuConfig) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "model": cfg.model_name, "device": state["embedder"].device}
+        emb = state["embedder"]
+        return {"status": "ok", "model": cfg.model_name, "device": emb.device,
+                "precision": getattr(emb, "precision", "fp32")}
 
     @app.get("/v1/models")
     def models() -> dict:

@@ -13,6 +13,8 @@ dependencies = [
     "tokenizers>=0.20",
     "numpy>=1.26",
     "huggingface_hub>=0.26",
+    # Builds int8 / nf4 copies of ONNX models during setup (quantization.py); OSV-checked pin.
+    "onnx==1.23.2",
 ]
 
 [project.optional-dependencies]
@@ -27,9 +29,12 @@ jina = [
     "transformers==5.22.1",
 ]
 # jina with [gpu] provider = "cuda": PyTorch's CUDA 13.0 build, pinned by URL and sha256 (not on PyPI).
+# accelerate + bitsandbytes: [rerank] quantization = "int8" / "nf4" on the GPU.
 jina-cuda = [
     "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
     "transformers==5.22.1",
+    "accelerate==1.15.0",
+    "bitsandbytes==0.50.2",
 ]
 # [code_search] enabled = true: cocoindex-code (Code page, code-search MCP) and bge-code-v1 on PyTorch.
 # Exact pins checked against OSV; filelock >= 4.2.1 fixes the 2026 lock advisories pulled in through litellm.

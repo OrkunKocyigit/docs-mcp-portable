@@ -23,7 +23,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import paths
+from . import paths, quantization
 from .config import CodeSearchConfig, GpuConfig, load_config
 
 log = logging.getLogger("code-embed")
@@ -89,30 +89,23 @@ class BgeCodeEncoder:
         limits = cfg.limits(self.device)
         self.batch_size, self.max_length = limits.batch_size, limits.max_length
 
-        kwargs: dict = {"local_files_only": True}
-        if cuda:
-            from transformers import BitsAndBytesConfig
+        dtype = torch.float16 if cuda else torch.float32
 
-            kwargs["device_map"] = {"": gpu.device_id}
-            kwargs["dtype"] = torch.float16
-            if cfg.quantization == "int8":
-                kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            elif cfg.quantization == "nf4":
-                kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
-            self.quantization = cfg.quantization
-        else:
-            kwargs["dtype"] = torch.float32
-            self.quantization = "fp32"
+        def load(quantization_config):
+            if quantization_config is not None:
+                model = AutoModel.from_pretrained(str(model_dir), dtype=dtype, quantization_config=quantization_config,
+                                                  device_map={"": gpu.device_id}, local_files_only=True)
+            else:
+                model = AutoModel.from_pretrained(str(model_dir), dtype=dtype, local_files_only=True)
+                model.to(self._torch_device)
+            return model.eval()
 
         started = time.perf_counter()
-        self.model = AutoModel.from_pretrained(str(model_dir), **kwargs)
-        if not cuda:
-            self.model.to(self._torch_device)
-        self.model.eval()
+        self.model, applied = quantization.load_torch(load, cfg.quantization, cuda, dtype, log, cfg.model_name)
+        self.precision = applied if applied != "none" else ("fp16" if cuda else "fp32")
         self.dim = int(self.model.config.hidden_size)
         log.info("Loaded %s@%s on %s (%s) in %.0fs; batches of %d, truncated to %d tokens", cfg.model_repo,
-                 cfg.revision[:7], self.device, self.quantization, time.perf_counter() - started, self.batch_size,
+                 cfg.revision[:7], self.device, self.precision, time.perf_counter() - started, self.batch_size,
                  self.max_length)
 
     def encode(self, texts: list[str]) -> tuple[np.ndarray, int]:
@@ -172,7 +165,8 @@ def create_app(cfg: CodeSearchConfig, gpu: GpuConfig, encoder_factory=load_encod
     @app.get("/health")
     def health() -> dict:
         enc = state["encoder"]
-        return {"status": "ok", "model": cfg.model_name, "device": enc.device, "dimensions": enc.dim}
+        return {"status": "ok", "model": cfg.model_name, "device": enc.device, "dimensions": enc.dim,
+                "precision": getattr(enc, "precision", "fp32")}
 
     @app.get("/v1/models")
     def models() -> dict:

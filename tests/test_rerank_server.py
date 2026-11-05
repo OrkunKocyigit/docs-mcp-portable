@@ -110,7 +110,8 @@ class HttpTest(unittest.TestCase):
 
     def test_health(self):
         with urllib.request.urlopen(f"{self.base}/health", timeout=10) as r:
-            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-reranker-v2-m3", "device": "cpu"})
+            self.assertEqual(json.load(r), {"status": "ok", "model": "bge-reranker-v2-m3", "device": "cpu",
+                                            "precision": "fp32"})
 
     def test_rerank(self):
         status, body = self.post(json.dumps({"query": "tea", "documents": ["a", "tea"], "top_n": 1}).encode())
@@ -128,7 +129,7 @@ BGE_DIR = paths.model_dir(RerankConfig().bge_repo)
 CPU = GpuConfig()
 
 
-@unittest.skipUnless((BGE_DIR / RerankConfig().bge_file(CPU)).exists(), "bge-reranker-v2-m3 not downloaded")
+@unittest.skipUnless((BGE_DIR / "onnx" / "model_int8.onnx").exists(), "bge-reranker-v2-m3 int8 not downloaded")
 class BgeModelTest(unittest.TestCase):
     def test_relevant_passage_ranks_first(self):
         from docs_portable.rerank_server import BgeReranker

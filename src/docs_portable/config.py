@@ -9,6 +9,13 @@ from .paths import CONFIG_FILE
 
 
 GPU_PROVIDERS = ("none", "cuda", "directml")
+# Weight quantization for every model loader; see quantization.py for what each runtime/device supports.
+QUANT_LEVELS = ("none", "int8", "nf4")
+
+
+def _check_quantization(section: str, value: object, levels: tuple[str, ...] = QUANT_LEVELS) -> None:
+    if value not in levels:
+        raise ValueError(f"config.toml: [{section}] quantization must be one of {', '.join(levels)}")
 
 
 @dataclass
@@ -65,6 +72,8 @@ class EmbeddingConfig:
     # out-of-memory, it just gets many times slower). docs-mcp-server chunks are up to ~1300 tokens.
     gpu: EmbeddingLimits = field(default_factory=lambda: EmbeddingLimits(batch_size=2, max_length=2048))
     threads: int = 0
+    # "int8" (CPU), "nf4" (CPU, CUDA) or "none". Changing it changes the vectors: re-scrape for best results.
+    quantization: str = "int8"
     access_log: bool = False
 
     @property
@@ -76,6 +85,7 @@ class EmbeddingConfig:
         return self.cpu if device == "cpu" else self.gpu
 
     def validate(self) -> None:
+        _check_quantization("embedding", self.quantization)
         self.cpu.validate("embedding.cpu")
         self.gpu.validate("embedding.gpu")
 
@@ -118,7 +128,9 @@ class RerankConfig:
     gpu: RerankLimits = field(default_factory=lambda: RerankLimits(candidates=30, bge_max_length=1024))
     bge_repo: str = "onnx-community/bge-reranker-v2-m3-ONNX"
     bge_revision: str = "6f5ff65298512715a1e669753bc754d2bc8f367b"
-    # "auto" = onnx/model_fp16.onnx on a GPU, onnx/model_int8.onnx on the CPU.
+    # Weights for either backend: "int8", "nf4" or "none" (see quantization.py for device support).
+    quantization: str = "int8"
+    # "auto" = follow `quantization` (fp16 file on a GPU, fp32 on the CPU when unquantized); or one ONNX file.
     bge_onnx_file: str = "auto"
     jina_repo: str = "jinaai/jina-reranker-v3.5"
     # Pinned because the model runs its own Python code (trust_remote_code).
@@ -135,11 +147,6 @@ class RerankConfig:
         """Limits for the device the reranker runs on: "cpu", "cuda" or "directml"."""
         return self.cpu if device == "cpu" else self.gpu
 
-    def bge_file(self, gpu: GpuConfig) -> str:
-        if self.bge_onnx_file != "auto":
-            return self.bge_onnx_file
-        return "onnx/model_fp16.onnx" if gpu.enabled else "onnx/model_int8.onnx"
-
     @property
     def model_name(self) -> str:
         return "bge-reranker-v2-m3" if self.backend == "bge" else "jina-reranker-v3.5"
@@ -150,6 +157,11 @@ class RerankConfig:
                 raise ValueError(f"config.toml: [rerank] {name} must be true or false")
         if self.backend not in RERANK_BACKENDS:
             raise ValueError(f"config.toml: [rerank] backend must be one of {', '.join(RERANK_BACKENDS)}")
+        _check_quantization("rerank", self.quantization)
+        if not isinstance(self.bge_onnx_file, str) or (
+                self.bge_onnx_file != "auto" and not re.match(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*\.onnx$", self.bge_onnx_file)
+                or ".." in self.bge_onnx_file):
+            raise ValueError("config.toml: [rerank] bge_onnx_file must be \"auto\" or a relative .onnx path")
         # docs-mcp-server sends query and chunk text here; keep it on this machine.
         if self.host not in LOOPBACK_HOSTS:
             raise ValueError(f"config.toml: [rerank] host must be one of {', '.join(LOOPBACK_HOSTS)}")
@@ -257,7 +269,6 @@ class JevConfig:
             )
 
 
-CODE_QUANTIZATIONS = ("int8", "nf4", "fp16")
 CODE_LIMIT_KEYS = ("batch_size", "max_length")
 _HOSTNAME = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 _IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
@@ -292,7 +303,7 @@ class CodeSearchConfig:
     model_repo: str = "BAAI/bge-code-v1"
     revision: str = "bd67852057c5d7ddcc7b8234d9d6c410117ed851"
     model_name: str = "bge-code-v1"
-    # Weights on an NVIDIA GPU: "int8" (bitsandbytes), "nf4" or "fp16". On the CPU the model runs in float32.
+    # "int8" (CUDA: bitsandbytes, CPU: dynamic int8), "nf4" (CUDA only) or "none" (fp16 on a GPU, fp32 on the CPU).
     quantization: str = "int8"
     # Prepended to search queries only (bge-code-v1 is asymmetric); indexed code is embedded as is.
     query_instruction: str = "Given a web search query, retrieve relevant code that can help answer the query."
@@ -325,8 +336,7 @@ class CodeSearchConfig:
         for name in ("host", "embed_host"):
             if getattr(self, name) not in LOOPBACK_HOSTS:
                 raise ValueError(f"config.toml: [code_search] {name} must be one of {', '.join(LOOPBACK_HOSTS)}")
-        if self.quantization not in CODE_QUANTIZATIONS:
-            raise ValueError(f"config.toml: [code_search] quantization must be one of {', '.join(CODE_QUANTIZATIONS)}")
+        _check_quantization("code_search", self.quantization)
         if not isinstance(self.revision, str) or not _GIT_SHA.match(self.revision):
             raise ValueError("config.toml: [code_search] revision must be a full 40-character commit hash")
         if not isinstance(self.model_name, str) or not re.match(r"^[A-Za-z0-9._-]{1,64}$", self.model_name):
