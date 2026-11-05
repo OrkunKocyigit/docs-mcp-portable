@@ -31,3 +31,11 @@ jina-cuda = [
     "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
     "transformers==5.22.1",
 ]
+# [jev] enabled = true (autotrust/JEV-9B behind jev-mcp); needs [gpu] provider = "cuda".
+# accelerate offloads layers to RAM, bitsandbytes provides int8 / nf4 (the System 1 LoRA is applied by jev_server).
+jev = [
+    "torch @ https://download.pytorch.org/whl/cu130/torch-2.14.1%2Bcu130-cp312-cp312-win_amd64.whl#sha256=0a09031e93632d14ef49553acd6211ece3ae9cdc0969a369b8c24e3cc4d15be9",
+    "transformers==5.22.1",
+    "accelerate==1.15.0",
+    "bitsandbytes==0.50.2",
+]

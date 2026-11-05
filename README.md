@@ -32,6 +32,7 @@ First run (needs internet, roughly 3 GB, a few minutes):
 | 5 | Chromium for JS-rendered sites (Playwright) | `runtime\browsers` |
 | 6 | BGE-M3 ONNX model (~2.3 GB, resumable) | `runtime\models` |
 | 7 | bge-reranker-v2-m3 ONNX model (int8 ~570 MB on CPU, fp16 ~1.1 GB on GPU) + rerank patch for docs-mcp-server | `runtime\models`, `runtime\app` |
+| 8 | Only with `[jev] enabled = true`: PyTorch CUDA extras, JEV-9B (~18 GB) and jev-mcp | `runtime\python`, `runtime\models`, `runtime\jev-mcp` |
 
 Later runs start in seconds and work offline (except for scraping, of course).
 
@@ -57,6 +58,7 @@ start.bat                    rem install what is missing, then run everything
 start.bat setup              rem only download/install
 start.bat embedding-server   rem only the embedding endpoint
 start.bat rerank-server      rem only the rerank endpoint
+start.bat jev-server         rem only the JEV-9B endpoint (needs DOCS_PORTABLE_JEV_TOKEN, 32+ chars)
 start.bat cli <args...>      rem docs-mcp-server CLI with the same portable data and embedding setup
 ```
 
@@ -136,7 +138,9 @@ extra docs-mcp-server flags and environment variables such as `GITHUB_TOKEN`). N
   incompatible. Re-scrape with `--replace` afterwards.
 - **No GPU needed.** Embeddings run on the CPU by default (`onnxruntime`, no PyTorch/CUDA). Expect roughly 3 GB of RAM
   for the model and slower indexing than on a GPU (queries are fast; a large docs site can take a while to index).
-  Tune `threads` (CPU threads, `0` = all cores) and `batch_size` in `config.toml` for your machine.
+  Tune `threads` (CPU threads, `0` = all cores) and, per device, `batch_size`/`max_length` in `[embedding.cpu]` and
+  `[embedding.gpu]`. The GPU defaults (2 texts, 2048 tokens) are small on purpose: on Windows a GPU that runs out of
+  memory does not fail, it silently spills into system RAM and indexing becomes many times slower.
 
 ### GPU
 
@@ -161,6 +165,45 @@ GPU builds are Windows x64 only. Switching back to `"none"` reinstalls the CPU b
 `runtime\python` until you delete that folder. Virtual display adapters (e.g. Android emulators) count as GPUs for
 DirectML, so set `device_id` if the wrong one is picked.
 
+### JEV-9B judgments (jev-mcp, NVIDIA GPU only)
+
+[jev-mcp](https://github.com/jkudish/jev-mcp) gives an MCP client typed judgment tools (`jev_verify`, `jev_screen`,
+`jev_rerank`, `jev_classify`, `jev_decide`, `jev_review`, ...). Instead of TypeSafe's hosted Jev, docs-portable answers
+them locally with [autotrust/JEV-9B](https://huggingface.co/autotrust/JEV-9B), an open distillation of Jev 1.13:
+
+```toml
+[gpu]
+provider = "cuda"
+
+[jev]
+enabled = true
+quantization = "int8"   # "int8", "nf4" or "bf16"
+```
+
+The next start installs PyTorch (CUDA), transformers, accelerate and bitsandbytes (pinned under
+`[project.optional-dependencies] jev`), downloads the model pinned to `revision` (~18 GB) and `@jkudish/jev-mcp`
+(pinned `mcp_version`, into `runtime\jev-mcp`). At run time the model loads in the background while docs search is
+already up; then the launcher prints where its layers went and starts jev-mcp:
+
+```json
+{ "mcpServers": { "jev": { "url": "http://127.0.0.1:8090/mcp" } } }
+```
+
+- **Memory.** In bf16 the model is 18 GB. Decoder layers go to the GPU while they fit (`gpu_memory_gb`, `0` = free VRAM
+  at start-up minus `gpu_reserve_gb`), the rest to RAM (`cpu_memory_gb`) and are streamed to the GPU on every pass;
+  anything beyond that is read from disk, which is very slow. `int8`/`nf4` only shrink the layers that stay on the GPU:
+  bitsandbytes keeps offloaded layers in bf16. The 2 GB token embedding and the unused `lm_head` stay on disk.
+- **Speed.** Several questions share one forward pass (`batch_tokens`), but every pass moves the offloaded layers over
+  PCIe, so expect seconds per request rather than Jev's ~0.3 s. `request_timeout_ms` is what jev-mcp waits.
+- **Local only.** The System One endpoint (`port`, default 8083) and jev-mcp (`mcp_port`, default 8090) bind to
+  loopback. The endpoint requires a bearer token the launcher generates on every start and hands to jev-mcp; jev-mcp
+  gets no hosted-provider keys (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, ... are removed from its environment).
+- **How questions map.** JEV-9B answers yes/no, 0-5 and 2-16 plain options. Noul criteria are appended to the question;
+  choice descriptions become `key: description` options, and more than 16 options run as a tournament (groups of up to
+  16, then a final); a score with described levels is asked as a choice over the levels and reported as the
+  probability-weighted level. States longer than `max_state_tokens` keep their first 60% and last 40%. Images are
+  rejected. Answers are close to hosted Jev, not identical (see the model card's limitations).
+
 ## Requirements and limits
 
 - Windows 10 (1803+) or 11, x64 or ARM64, and internet on first run. The batch file only uses `curl.exe` and
@@ -174,4 +217,5 @@ This project is MIT licensed. It downloads, at runtime, docs-mcp-server (MIT), B
 (Apache-2.0), Node.js (MIT), Python (PSF), pip (MIT) and Chromium via Playwright (BSD-style/Apache-2.0); each keeps
 its own license. Only when explicitly enabled: jina-reranker-v3.5 (**CC BY-NC 4.0, non-commercial**), PyTorch
 (BSD-3-Clause) and transformers (Apache-2.0); with `[gpu]`: onnxruntime-gpu / onnxruntime-directml (MIT) and the
-NVIDIA CUDA/cuDNN runtime wheels (NVIDIA software license).
+NVIDIA CUDA/cuDNN runtime wheels (NVIDIA software license); with `[jev]`: autotrust/JEV-9B and its base Qwen3.5-9B
+(Apache-2.0), accelerate (Apache-2.0), bitsandbytes (MIT) and jev-mcp (MIT).

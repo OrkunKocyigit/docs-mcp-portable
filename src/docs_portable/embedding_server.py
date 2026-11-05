@@ -27,15 +27,18 @@ class Embedder:
         if not (onnx_dir / "model.onnx").exists():
             raise SystemExit(f"Model not found in {onnx_dir}. Run the launcher once to download it.")
 
-        self.batch_size = max(1, cfg.batch_size)
-        self.tokenizer = Tokenizer.from_file(str(onnx_dir / "tokenizer.json"))
-        self.tokenizer.no_padding()
-        self.tokenizer.enable_truncation(max_length=cfg.max_length)
-        self.pad_id = self.tokenizer.token_to_id("<pad>") or 1
-
         self.session = create_session(onnx_dir / "model.onnx", gpu, cfg.threads, "embedding")
         self.device = device_name(self.session)
         self._run_options = run_options(gpu)
+
+        limits = cfg.limits(self.device)
+        self.batch_size = limits.batch_size
+        self.tokenizer = Tokenizer.from_file(str(onnx_dir / "tokenizer.json"))
+        self.tokenizer.no_padding()
+        self.tokenizer.enable_truncation(max_length=limits.max_length)
+        self.pad_id = self.tokenizer.token_to_id("<pad>") or 1
+        logging.getLogger("embedding").info("Batches of %d texts, truncated to %d tokens on %s",
+                                            limits.batch_size, limits.max_length, self.device)
         self._inputs = {i.name for i in self.session.get_inputs()}
         self._lock = threading.Lock()
 

@@ -24,6 +24,11 @@ from .config import Config, GpuConfig
 USER_AGENT = "docs-portable/0.1 (+https://github.com/arabold/docs-mcp-server)"
 MODEL_PATTERNS = ["onnx/*", "README.md"]
 JINA_PATTERNS = ["*.json", "*.txt", "modeling.py", "model.safetensors", "README.md"]
+# Backbone, tokenizer, System 1 LoRA (adapter/) and decision head; not the vLLM / vision extras.
+JEV_PATTERNS = ["config.json", "model-*.safetensors", "model.safetensors.index.json", "tokenizer.json",
+                "tokenizer_config.json", "chat_template.jinja", "head.safetensors", "judge_config.json",
+                "calibration.json", "adapter/*", "README.md"]
+JEV_MCP_PACKAGE = "@jkudish/jev-mcp"
 
 
 def say(message: str) -> None:
@@ -216,33 +221,104 @@ def _snapshot(repo: str, revision: str, patterns: list[str], label: str) -> None
     marker.write_text(stamp)
 
 
-def jina_requirements(gpu: GpuConfig) -> list[str]:
-    group = "jina-cuda" if gpu.provider == "cuda" else "jina"
+def _optional(group: str) -> list[str]:
     with (paths.ROOT / "pyproject.toml").open("rb") as fh:
         return tomllib.load(fh)["project"]["optional-dependencies"][group]
 
 
-def ensure_jina_dependencies(gpu: GpuConfig) -> None:
+def jina_requirements(gpu: GpuConfig) -> list[str]:
+    return _optional("jina-cuda" if gpu.provider == "cuda" else "jina")
+
+
+def torch_requirements(cfg: Config) -> list[str]:
+    """PyTorch-based extras for the enabled features: the jina reranker and/or JEV-9B (one torch build)."""
+    deps: list[str] = []
+    if cfg.rerank.enabled and cfg.rerank.backend == "jina":
+        deps += jina_requirements(cfg.gpu)
+    if cfg.jev.enabled:
+        deps += _optional("jev")
+    return list(dict.fromkeys(deps))
+
+
+def _wanted_torch(deps: list[str]) -> str | None:
+    for dep in deps:
+        name, _, rest = dep.partition(" @ ")
+        if name == "torch":  # URL pin: the version is in the wheel file name, e.g. torch-2.14.1%2Bcu130-...
+            return rest.rsplit("/", 1)[-1].split("-")[1].replace("%2B", "+")
+        if dep.startswith("torch=="):
+            return dep.removeprefix("torch==")
+    return None
+
+
+def _installed(package: str) -> str | None:
+    from importlib import metadata
+
+    try:
+        return metadata.version(package)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def ensure_torch_dependencies(cfg: Config) -> None:
+    deps = torch_requirements(cfg)
+    if not deps:
+        return
     if sys.platform == "win32" and platform.machine().upper() != "AMD64":
-        raise RuntimeError("The jina reranker needs PyTorch, which has no Windows ARM64 wheel; use backend = \"bge\".")
-    deps = jina_requirements(gpu)
-    marker = Path(sys.executable).resolve().parent / ".deps-jina"
+        raise RuntimeError("PyTorch has no Windows ARM64 wheel; use [rerank] backend = \"bge\" and [jev] enabled = false.")
+    marker = Path(sys.executable).resolve().parent / ".deps-torch"
     digest = hashlib.sha256("\n".join(sorted(deps)).encode()).hexdigest()
     if marker.exists() and marker.read_text() == digest:
         return
-    say("Installing jina reranker dependencies: " + ", ".join(d.split(" @ ")[0] for d in deps)
-        + (" (CUDA build of torch, about 2 GB)" if gpu.provider == "cuda" else ""))
+    wanted = _wanted_torch(deps)
+    say("Installing PyTorch extras: " + ", ".join(d.split(" @ ")[0] for d in deps)
+        + (" (CUDA build of torch, about 2 GB)" if wanted and "+cu" in wanted and _installed("torch") != wanted else ""))
     env = os.environ.copy()
     env["PIP_CACHE_DIR"] = str(paths.CACHE_DIR / "pip")
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     # The CPU and CUDA builds of torch share a name; remove the other one so pip cannot keep it.
-    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torch"], env=env, capture_output=True)
+    if _installed("torch") not in (None, wanted):
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torch"], env=env, capture_output=True)
     _run(
         [sys.executable, "-m", "pip", "install", "--no-warn-script-location", "--only-binary=:all:", *deps],
         env,
-        "pip install (jina reranker)",
+        "pip install (PyTorch extras)",
     )
     marker.write_text(digest)
+
+
+def _jev_mcp_dir() -> Path:
+    return paths.JEV_MCP_DIR / "node_modules" / Path(*JEV_MCP_PACKAGE.split("/"))
+
+
+def jev_mcp_entrypoint() -> Path:
+    pkg = _jev_mcp_dir()
+    bin_field = json.loads((pkg / "package.json").read_text(encoding="utf-8"))["bin"]
+    return pkg / (bin_field if isinstance(bin_field, str) else bin_field["jev-mcp"])
+
+
+def ensure_jev(cfg: Config) -> None:
+    jev = cfg.jev
+    if not jev.enabled:
+        return
+    _snapshot(jev.repo, jev.revision, JEV_PATTERNS, f"{jev.repo} (about 18 GB, Apache-2.0)")
+    manifest = _jev_mcp_dir() / "package.json"
+    if manifest.exists() and json.loads(manifest.read_text(encoding="utf-8")).get("version") == jev.mcp_version:
+        return
+    say(f"Installing {JEV_MCP_PACKAGE}@{jev.mcp_version} (npm)")
+    paths.JEV_MCP_DIR.mkdir(parents=True, exist_ok=True)
+    root = paths.JEV_MCP_DIR / "package.json"
+    if not root.exists():
+        root.write_text('{"name":"docs-portable-jev","private":true}\n', encoding="utf-8")
+    # Separate prefix so it cannot disturb the patched docs-mcp-server; no install scripts are needed.
+    _run(
+        [str(paths.NODE_EXE), str(paths.NPM_CLI), "install", f"{JEV_MCP_PACKAGE}@{jev.mcp_version}", "--save-exact",
+         "--ignore-scripts"],
+        node_env(),
+        "npm install (jev-mcp)",
+        cwd=paths.JEV_MCP_DIR,
+    )
+    if not manifest.exists():
+        raise RuntimeError("npm finished but jev-mcp was not installed")
 
 
 def ensure_rerank(cfg: Config) -> None:
@@ -254,7 +330,6 @@ def ensure_rerank(cfg: Config) -> None:
         _snapshot(rr.bge_repo, rr.bge_revision, [onnx_file, "tokenizer.json", "config.json", "README.md"],
                   f"{rr.bge_repo} ({onnx_file})")
     else:
-        ensure_jina_dependencies(cfg.gpu)
         _snapshot(rr.jina_repo, rr.jina_revision, JINA_PATTERNS, f"{rr.jina_repo} (about 1.2 GB, CC BY-NC 4.0)")
 
     try:
@@ -275,5 +350,7 @@ def ensure_all(cfg: Config) -> None:
     ensure_docs_mcp(cfg)
     ensure_browser(cfg)
     ensure_model(cfg)
+    ensure_torch_dependencies(cfg)
     ensure_rerank(cfg)
+    ensure_jev(cfg)
     say("Everything is installed.")

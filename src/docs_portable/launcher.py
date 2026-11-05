@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -15,8 +16,11 @@ from ctypes import wintypes
 
 from . import installer, paths
 from .config import Config
+from .jev_protocol import TOKEN_ENV as JEV_TOKEN_ENV
 
 HEALTH_TIMEOUT_S = 300
+JEV_LOAD_TIMEOUT_S = 1800  # 18 GB from disk plus quantization on load
+JEV_MCP_STRIP_PREFIXES = ("JEV_", "TYPESAFE_", "OPENROUTER_", "CLOUDFLARE_", "AI_GATEWAY_")
 RERANK_ENV = (
     "DOCS_PORTABLE_RERANK_URL",
     "DOCS_PORTABLE_RERANK_MODEL",
@@ -158,6 +162,36 @@ def _model_env() -> dict[str, str]:
     return env
 
 
+def jev_mcp_env(cfg: Config, token: str) -> dict[str, str]:
+    """jev-mcp talks only to the local JEV-9B endpoint: every hosted-provider setting is removed."""
+    env = {k: v for k, v in installer.node_env().items()
+           if not k.upper().startswith(JEV_MCP_STRIP_PREFIXES) and k.upper() not in ("HOST", "PORT")}
+    jev = cfg.jev
+    env.update(
+        {
+            "JEV_PROVIDER": "compatible",
+            "JEV_API_BASE_URL": jev.url,
+            "JEV_API_KEY": token,
+            "JEV_MCP_MODEL": jev.model_name,
+            "JEV_MCP_REQUEST_TIMEOUT_MS": str(jev.request_timeout_ms),
+            # A retry would recompute the whole request on the GPU.
+            "JEV_MCP_MAX_ATTEMPTS": "1",
+            "JEV_MCP_TRANSPORT": "http",
+            "HOST": jev.mcp_host,
+            "PORT": str(jev.mcp_port),
+        }
+    )
+    return env
+
+
+def _jev_ready(cfg: Config) -> None:
+    jev = cfg.jev
+    with urllib.request.urlopen(f"http://{jev.host}:{jev.port}/health", timeout=10) as r:
+        health = json.load(r)
+    print(f"[run] JEV-9B ready ({jev.quantization}: {health.get('gpu_layers', '?')} layers on the GPU, "
+          f"{health.get('cpu_layers', '?')} in RAM, {health.get('disk_layers', '?')} on disk)", flush=True)
+
+
 def docs_mcp_env(cfg: Config, rerank_device: str | None = None) -> dict[str, str]:
     for d in (paths.STORE_DIR, paths.APPDATA_DIR, paths.LOCALAPPDATA_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -218,10 +252,12 @@ def run(cfg: Config) -> int:
     installer.ensure_all(cfg)
     _kill_children_with_launcher()
 
-    emb, rr, docs = cfg.embedding, cfg.rerank, cfg.docs_mcp
+    emb, rr, docs, jev = cfg.embedding, cfg.rerank, cfg.docs_mcp, cfg.jev
     ports = [("embedding", emb.host, emb.port), ("docs-mcp-server", docs.host, docs.port)]
     if rr.enabled:
         ports.append(("rerank", rr.host, rr.port))
+    if jev.enabled:
+        ports += [("jev", jev.host, jev.port), ("jev-mcp", jev.mcp_host, jev.mcp_port)]
     for name, host, port in ports:
         if not _port_free(host, port):
             print(f"[run] Port {port} ({name}) is already in use. Change it in config.toml.", file=sys.stderr)
@@ -230,6 +266,9 @@ def run(cfg: Config) -> int:
     embed: subprocess.Popen | None = None
     rerank: subprocess.Popen | None = None
     server: subprocess.Popen | None = None
+    jev_server: subprocess.Popen | None = None
+    jev_mcp: subprocess.Popen | None = None
+    jev_token = secrets.token_urlsafe(32)
     try:
         print("[run] Starting embedding server...", flush=True)
         embed = subprocess.Popen([sys.executable, "-m", "docs_portable.embedding_server"], env=_model_env())
@@ -242,6 +281,12 @@ def run(cfg: Config) -> int:
         if rerank is not None:
             _wait_healthy(f"http://{rr.host}:{rr.port}/health", rerank, "Rerank server")
             rerank_device = _smoke_test_rerank(cfg)
+        if jev.enabled:
+            # After the other models are on the GPU, so its automatic VRAM budget sees what they use.
+            print("[run] Loading JEV-9B in the background (can take several minutes)...", flush=True)
+            jev_server = subprocess.Popen([sys.executable, "-m", "docs_portable.jev_server"],
+                                          env={**_model_env(), JEV_TOKEN_ENV: jev_token})
+        jev_deadline = time.monotonic() + JEV_LOAD_TIMEOUT_S
 
         cmd = [
             str(paths.NODE_EXE),
@@ -262,6 +307,36 @@ def run(cfg: Config) -> int:
                 if proc is not None and proc.poll() is not None:
                     print(f"[run] {name} exited with code {proc.returncode}; shutting down.", flush=True)
                     return proc.returncode or 1
+            # JEV is optional: if it fails, docs search keeps running without it.
+            if jev_server is not None:
+                if jev_server.poll() is not None or (jev_mcp is None and time.monotonic() > jev_deadline):
+                    print("[run] JEV-9B stopped or did not load in time; continuing without jev-mcp.", file=sys.stderr,
+                          flush=True)
+                    _stop(jev_mcp)
+                    _stop(jev_server)
+                    jev_server = jev_mcp = None
+                elif jev_mcp is None and not _port_free(jev.host, jev.port):
+                    try:
+                        _jev_ready(cfg)
+                    except (urllib.error.URLError, OSError, ValueError):
+                        pass  # still loading
+                    else:
+                        jev_mcp = subprocess.Popen([str(paths.NODE_EXE), str(installer.jev_mcp_entrypoint()), "--http"],
+                                                   env=jev_mcp_env(cfg, jev_token))
+                        try:
+                            _wait_healthy(f"http://{jev.mcp_host}:{jev.mcp_port}/health", jev_mcp, "jev-mcp")
+                        except RuntimeError as exc:
+                            print(f"[run] {exc}; continuing without jev-mcp.", file=sys.stderr, flush=True)
+                            _stop(jev_mcp)
+                            _stop(jev_server)
+                            jev_server = jev_mcp = None
+                        else:
+                            print(f"[run] jev-mcp ready -> http://{jev.mcp_host}:{jev.mcp_port}/mcp", flush=True)
+                elif jev_mcp is not None and jev_mcp.poll() is not None:
+                    print(f"[run] jev-mcp exited with code {jev_mcp.returncode}; continuing without it.",
+                          file=sys.stderr, flush=True)
+                    _stop(jev_server)
+                    jev_server = jev_mcp = None
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[run] Stopping...", flush=True)
@@ -270,6 +345,8 @@ def run(cfg: Config) -> int:
         print(f"[run] {exc}", file=sys.stderr)
         return 1
     finally:
+        _stop(jev_mcp)
+        _stop(jev_server)
         _stop(server)
         _stop(rerank)
         _stop(embed)

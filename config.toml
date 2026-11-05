@@ -21,14 +21,23 @@ model_repo = "BAAI/bge-m3"
 model_name = "bge-m3"
 host = "127.0.0.1"
 port = 8081
-# Truncation limit in tokens (bge-m3 supports up to 8192).
-max_length = 8192
-# Texts per ONNX forward pass.
-batch_size = 8
 # CPU threads for inference, 0 = onnxruntime default.
 threads = 0
 # Log every /v1/embeddings request.
 access_log = false
+
+# Cost limits, one set per device; the set matching where the model really runs is used.
+#   batch_size = texts per ONNX forward pass (padded to the longest text in the batch).
+#   max_length = truncation limit in tokens (bge-m3 supports up to 8192); attention memory grows with its square.
+[embedding.cpu]
+batch_size = 8
+max_length = 8192
+
+[embedding.gpu]
+# Larger values can overflow the GPU: Windows then silently moves GPU memory into system RAM and everything
+# becomes many times slower. docs-mcp-server chunks are up to ~1300 tokens, so 2048 truncates nothing it indexes.
+batch_size = 2
+max_length = 2048
 
 [rerank]
 # Re-scores the top hybrid-search candidates with a cross-encoder/listwise reranker before
@@ -40,7 +49,7 @@ enabled = true
 #          [gpu] provider = "cuda".
 backend = "bge"
 # Required for backend = "jina": confirms this installation is for non-commercial use.
-accept_noncommercial_license = false
+accept_noncommercial_license = true
 host = "127.0.0.1"
 port = 8082
 # bge ONNX variant. "auto" = onnx/model_fp16.onnx (1.1 GB) on a GPU, onnx/model_int8.onnx (570 MB) on the
@@ -68,6 +77,39 @@ timeout_ms = 30000
 candidates = 30
 bge_max_length = 1024
 timeout_ms = 30000
+
+[jev]
+# Optional: autotrust/JEV-9B (Apache-2.0, a Qwen3.5-9B fine-tune) answering typed judgments locally, exposed to
+# MCP clients by jev-mcp (MIT) as jev_verify, jev_screen, jev_rerank, jev_classify, ... at
+# http://<mcp_host>:<mcp_port>/mcp. Nothing is sent to TypeSafe or any other hosted provider.
+# Needs [gpu] provider = "cuda". Downloads about 18 GB (model) + 2 GB (CUDA PyTorch) on the next start.
+enabled = false
+# Weights on the GPU: "int8", "nf4" (smaller, may shift probabilities) or "bf16". Layers that do not fit
+# are kept in RAM in bf16 (bitsandbytes cannot offload quantized layers) and streamed to the GPU per pass;
+# beyond the RAM budget they are read from disk (very slow).
+quantization = "int8"
+# VRAM for weights in GB; 0 = free VRAM at start-up minus gpu_reserve_gb (the bge models load first).
+# The reserve covers CUDA workspaces and layers streamed in from RAM (~2 GB measured on an 8 GB card); if it is
+# too small Windows silently spills into shared memory and each pass takes a minute instead of a second.
+gpu_memory_gb = 0
+gpu_reserve_gb = 3.0
+# RAM for offloaded layers in GB; 0 = available RAM minus 4 GB.
+cpu_memory_gb = 0
+# Prompt limits in tokens. States longer than max_state_tokens keep their first 60% and last 40%.
+max_state_tokens = 1024
+max_prompt_tokens = 4096
+# Tokens per forward pass; several questions share one pass (and one trip of the offloaded layers).
+batch_tokens = 8192
+# Local System One endpoint (bearer-token protected, token generated per run) and the jev-mcp endpoint.
+host = "127.0.0.1"
+port = 8083
+mcp_host = "127.0.0.1"
+mcp_port = 8090
+# Pinned @jkudish/jev-mcp version; installed into runtime\jev-mcp.
+mcp_version = "0.14.7"
+# jev-mcp gives up on a request after this many milliseconds.
+request_timeout_ms = 600000
+access_log = false
 
 [docs_mcp]
 package = "@arabold/docs-mcp-server"

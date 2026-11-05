@@ -4,7 +4,7 @@ import unittest
 from urllib.parse import urlparse
 
 from docs_portable import installer, paths
-from docs_portable.config import GpuConfig
+from docs_portable.config import GpuConfig, parse_config
 
 _spec = importlib.util.spec_from_file_location("bootstrap", paths.ROOT / "bootstrap.py")
 bootstrap = importlib.util.module_from_spec(_spec)
@@ -56,6 +56,29 @@ class JinaRequirementsTest(unittest.TestCase):
         self.assertEqual(url.hostname, "download.pytorch.org")
         self.assertRegex(url.fragment, r"^sha256=[0-9a-f]{64}$")
         self.assertIn("transformers==5.22.1", deps)
+
+
+class TorchRequirementsTest(unittest.TestCase):
+    def test_nothing_without_torch_features(self):
+        self.assertEqual(installer.torch_requirements(parse_config({})), [])
+
+    def test_jev_and_jina_share_one_torch(self):
+        cfg = parse_config({"gpu": {"provider": "cuda"}, "jev": {"enabled": True},
+                            "rerank": {"backend": "jina", "accept_noncommercial_license": True}})
+        deps = installer.torch_requirements(cfg)
+        self.assertEqual([bootstrap.requirement_name(d) for d in deps].count("torch"), 1)
+        self.assertEqual(len(deps), len(set(deps)))
+        for package in ("accelerate==1.15.0", "bitsandbytes==0.50.2", "transformers==5.22.1"):
+            self.assertIn(package, deps)
+        self.assertEqual(installer._wanted_torch(deps), "2.14.1+cu130")
+
+    def test_jev_packages_are_pinned(self):
+        for req in PROJECT["optional-dependencies"]["jev"]:
+            self.assertTrue("==" in req or "#sha256=" in req, req)
+
+    def test_wanted_torch_from_pypi_pin(self):
+        self.assertEqual(installer._wanted_torch(["transformers==1", "torch==2.15.0"]), "2.15.0")
+        self.assertIsNone(installer._wanted_torch(["transformers==1"]))
 
 
 if __name__ == "__main__":

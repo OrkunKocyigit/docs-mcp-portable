@@ -12,6 +12,7 @@ CONFIG_FILE = ROOT / "config.toml"
 
 NODE_DIR = RUNTIME / "node"
 APP_DIR = RUNTIME / "app"  # npm prefix holding docs-mcp-server
+JEV_MCP_DIR = RUNTIME / "jev-mcp"  # separate npm prefix holding jev-mcp
 BROWSERS_DIR = RUNTIME / "browsers"  # Playwright browsers
 MODELS_DIR = RUNTIME / "models"
 CACHE_DIR = RUNTIME / "cache"
