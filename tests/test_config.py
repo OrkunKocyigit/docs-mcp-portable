@@ -1,12 +1,25 @@
+import importlib.util
+import tempfile
 import unittest
+from pathlib import Path
+
+import numpy as np
 
 from docs_portable.config import parse_config
+
+
+def _cuda_available() -> bool:
+    if importlib.util.find_spec("onnxruntime") is None:
+        return False
+    import onnxruntime as ort
+
+    return "CUDAExecutionProvider" in ort.get_available_providers()
 
 
 class EmbeddingLimitsTest(unittest.TestCase):
     def test_defaults_per_device(self):
         emb = parse_config({}).embedding
-        self.assertEqual((emb.limits("cpu").batch_size, emb.limits("cpu").max_length), (8, 8192))
+        self.assertEqual((emb.limits("cpu").batch_size, emb.limits("cpu").max_length), (8, 2048))
         for device in ("cuda", "directml"):
             self.assertEqual((emb.limits(device).batch_size, emb.limits(device).max_length), (2, 2048))
 
@@ -221,11 +234,51 @@ class GpuConfigTest(unittest.TestCase):
         dml = parse_config({"gpu": {"provider": "directml"}}).gpu
         self.assertEqual(dml.onnx_providers(), [("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"])
 
+    def test_onnx_memory_limit_is_a_cuda_pool_cap_in_bytes(self):
+        cuda = parse_config({"gpu": {"provider": "cuda", "onnx_memory_limit_mb": 1536}}).gpu
+        self.assertEqual(cuda.onnx_providers(),
+                         [("CUDAExecutionProvider", {"device_id": 0, "gpu_mem_limit": 1536 * 2**20}),
+                          "CPUExecutionProvider"])
+        # DirectML has no such option; the CPU has nothing to cap.
+        dml = parse_config({"gpu": {"provider": "directml", "onnx_memory_limit_mb": 1536}}).gpu
+        self.assertEqual(dml.onnx_providers()[0], ("DmlExecutionProvider", {"device_id": 0}))
+        self.assertEqual(parse_config({"gpu": {"onnx_memory_limit_mb": 1536}}).gpu.onnx_providers(),
+                         ["CPUExecutionProvider"])
+
+    def test_no_onnx_memory_limit_by_default(self):
+        cuda = parse_config({"gpu": {"provider": "cuda"}}).gpu
+        self.assertEqual(cuda.onnx_memory_limit_mb, 0)
+        self.assertNotIn("gpu_mem_limit", cuda.onnx_providers()[0][1])
+
     def test_rejects_invalid_values(self):
         for gpu in ({"provider": "rocm"}, {"provider": True}, {"provider": "CUDA"}, {"device_id": -1},
-                    {"device_id": "0"}, {"device_id": True}, {"device_id": 65}, {"enabled": True}):
+                    {"device_id": "0"}, {"device_id": True}, {"device_id": 65}, {"enabled": True},
+                    {"onnx_memory_limit_mb": -1}, {"onnx_memory_limit_mb": 100}, {"onnx_memory_limit_mb": True},
+                    {"onnx_memory_limit_mb": "1536"}, {"onnx_memory_limit_mb": 1536.5},
+                    {"onnx_memory_limit_mb": 262145}):
             with self.subTest(gpu=gpu), self.assertRaises(ValueError):
                 parse_config({"gpu": gpu})
+
+    @unittest.skipUnless(_cuda_available(), "onnxruntime CUDA provider not available")
+    def test_capped_pool_rejects_an_oversized_request_instead_of_growing(self):
+        import onnx
+        from onnx import TensorProto, helper, numpy_helper
+
+        from docs_portable.onnx_session import create_session
+
+        # x [n, 64] @ w [64, 262144] -> output of n MiB (float32): 256 rows fit a 512 MiB pool, 1024 rows do not.
+        weight = numpy_helper.from_array(np.ones((64, 262144), dtype=np.float32), "w")
+        graph = helper.make_graph([helper.make_node("MatMul", ["x", "w"], ["y"])], "g",
+                                  [helper.make_tensor_value_info("x", TensorProto.FLOAT, [None, 64])],
+                                  [helper.make_tensor_value_info("y", TensorProto.FLOAT, [None, 262144])], [weight])
+        path = Path(tempfile.mkdtemp()) / "big.onnx"
+        onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9), str(path))
+        gpu = parse_config({"gpu": {"provider": "cuda", "onnx_memory_limit_mb": 512}}).gpu
+        session = create_session(path, gpu, 1, "test")
+        self.assertEqual(session.get_providers()[0], "CUDAExecutionProvider")
+        self.assertEqual(session.run(None, {"x": np.ones((256, 64), dtype=np.float32)})[0].shape, (256, 262144))
+        with self.assertRaisesRegex(Exception, "(?i)memory"):
+            session.run(None, {"x": np.ones((1024, 64), dtype=np.float32)})
 
     def test_old_providers_option_points_to_gpu_section(self):
         for section in ("embedding", "rerank"):

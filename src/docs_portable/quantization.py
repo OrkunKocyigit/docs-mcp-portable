@@ -9,6 +9,9 @@ ONNX (bge-m3, bge-reranker):
         `start.bat setup` builds model.int8.onnx from the fp32 model once.
   nf4   CPU and CUDA (MatMulBnb4, 4-bit NormalFloat weights, block 64), built once from the fp32 model.
         Embedding tables stay in full precision, so XLM-R models shrink less than with int8.
+  Unquantized on CUDA, a repository's fp16 file is used; without one, setup builds model.fp16.onnx from the fp32
+  model with attention, SkipLayerNorm and Gelu fused into onnxruntime's CUDA kernels (fused attention keeps its
+  memory linear in the sequence length).
 PyTorch (bge-code-v1, jina-reranker):
   int8  CUDA: bitsandbytes LLM.int8. CPU: torch dynamic int8 Linear layers.
   nf4   CUDA only (bitsandbytes 4-bit).
@@ -19,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 LEVELS = ("none", "int8", "nf4")
@@ -50,15 +53,21 @@ def onnx_plan(level: str, provider: str, *, fp32: str, fp16: str | None = None,
     """Plan for an ONNX model.
 
     provider: [gpu] provider ("none", "cuda", "directml"). fp32 / fp16: the full-precision files (fp16 is the
-    unquantized choice on a GPU when the repository has one). shipped: int8 files the repository provides.
+    unquantized choice on a GPU when the repository has one; on CUDA it is built otherwise). shipped: int8 files
+    the repository provides.
     """
     folder = fp32.rsplit("/", 1)[0] + "/" if "/" in fp32 else ""
     on_gpu = provider != "none"
-    normal = OnnxPlan(fp16, "fp16") if on_gpu and fp16 else OnnxPlan(fp32, "fp32")
+    if on_gpu and fp16:
+        normal = OnnxPlan(fp16, "fp16")
+    elif provider == "cuda":
+        normal = OnnxPlan(folder + generated_name("fp16"), "fp16", build_from=fp32)
+    else:
+        normal = OnnxPlan(fp32, "fp32")
 
     def unsupported(reason: str) -> OnnxPlan:
-        return OnnxPlan(normal.file, normal.precision,
-                        warning=f"quantization = \"{level}\" is not supported {reason}; loading {normal.precision}.")
+        return replace(normal,
+                       warning=f"quantization = \"{level}\" is not supported {reason}; loading {normal.precision}.")
 
     if level == "none":
         return normal
@@ -109,11 +118,26 @@ def download_patterns(plan: OnnxPlan, available: set[str]) -> list[str]:
     return files
 
 
-def build_onnx(source: Path, target: Path, level: str) -> None:
-    """Quantize source (fp32, external data allowed) into one self-contained file; atomic."""
+def build_onnx(source: Path, target: Path, level: str) -> str | None:
+    """Quantize or convert source (fp32, external data allowed) into one self-contained file; atomic.
+
+    Returns a short note for the setup log, or None.
+    """
     tmp = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
+    note = None
     try:
-        if level == "int8":
+        if level == "fp16":
+            from onnxruntime.transformers.optimizer import optimize_model
+
+            # Offline fusion only (opt_level=0: no session, so no GPU is needed to build). Graph inputs and outputs
+            # stay float32, so the servers feed and read the model exactly as before.
+            model = optimize_model(str(source), model_type="bert", opt_level=0, use_gpu=True)
+            fused = model.get_fused_operator_statistics().get("Attention", 0)
+            model.convert_float_to_float16(keep_io_types=True)
+            model.save_model_to_file(str(tmp), use_external_data_format=False)
+            note = (f"{fused} attention layers fused" if fused
+                    else "attention was not fused (unrecognised graph); plain fp16 weights")
+        elif level == "int8":
             from onnxruntime.quantization import QuantType, quantize_dynamic
 
             quantize_dynamic(source, tmp, weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul", "Gather"])
@@ -129,6 +153,7 @@ def build_onnx(source: Path, target: Path, level: str) -> None:
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
+    return note
 
 
 def resolve_onnx(model_dir: Path, plan: OnnxPlan, log: logging.Logger) -> tuple[Path, str]:

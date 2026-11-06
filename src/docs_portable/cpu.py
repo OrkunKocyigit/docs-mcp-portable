@@ -3,6 +3,7 @@
 Measured with bge-m3 int8 on 16 physical cores: two onnxruntime processes using all cores with idle spinning on
 ran 2.6x slower than one after the other; turning spinning off fixed that at no cost to a single process, and
 half the cores each was best when both were busy (one process alone loses only ~5% on half the cores).
+The reranker keeps all cores: its short calls lost much more (10 x 512-token pairs: 2.0 s -> 3.3 s on half).
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ def thread_plan(cfg: Config, cores: int | None = None) -> dict[str, int]:
         cores = cores or physical_cores()
         code = max(1, cores // 2)
         docs = max(1, cores - code) if cores > 1 else 1
-        plan = {"embedding": docs, "rerank": docs, "code": code}
+        plan = {"embedding": docs, "rerank": 0, "code": code}
     for name, configured in (("embedding", cfg.embedding.threads), ("rerank", cfg.rerank.threads),
                              ("code", cfg.code_search.threads)):
         if configured > 0:

@@ -23,13 +23,14 @@ class ThreadPlanTest(unittest.TestCase):
     def test_splits_cores_when_code_search_runs_on_the_cpu(self):
         cfg = parse_config(CPU_CODE)
         self.assertTrue(cpu.shares_cpu(cfg))
-        self.assertEqual(cpu.thread_plan(cfg, cores=16), {"embedding": 8, "rerank": 8, "code": 8})
-        self.assertEqual(cpu.thread_plan(cfg, cores=5), {"embedding": 3, "rerank": 3, "code": 2})
-        self.assertEqual(cpu.thread_plan(cfg, cores=1), {"embedding": 1, "rerank": 1, "code": 1})
+        # The reranker keeps all cores (short calls; spinning is off, so it does not starve the others).
+        self.assertEqual(cpu.thread_plan(cfg, cores=16), {"embedding": 8, "rerank": 0, "code": 8})
+        self.assertEqual(cpu.thread_plan(cfg, cores=5), {"embedding": 3, "rerank": 0, "code": 2})
+        self.assertEqual(cpu.thread_plan(cfg, cores=1), {"embedding": 1, "rerank": 0, "code": 1})
 
     def test_configured_threads_win(self):
         cfg = parse_config({**CPU_CODE, "embedding": {"threads": 6}, "code_search": {"enabled": True, "threads": 3}})
-        self.assertEqual(cpu.thread_plan(cfg, cores=16), {"embedding": 6, "rerank": 8, "code": 3})
+        self.assertEqual(cpu.thread_plan(cfg, cores=16), {"embedding": 6, "rerank": 0, "code": 3})
         cfg = parse_config({"rerank": {"threads": 2}})
         self.assertEqual(cpu.thread_plan(cfg, cores=16), {"embedding": 0, "rerank": 2, "code": 0})
 
@@ -37,7 +38,7 @@ class ThreadPlanTest(unittest.TestCase):
         self.assertIsNone(launcher.cpu_sharing_note(parse_config({})))
         with mock.patch.object(cpu, "physical_cores", return_value=12):
             note = launcher.cpu_sharing_note(parse_config(CPU_CODE))
-        self.assertIn("6 threads for embedding/rerank, 6 for bge-code-v1", note)
+        self.assertIn("6 threads for embedding, 6 for bge-code-v1, all for rerank", note)
         self.assertIn("override", note)
 
 

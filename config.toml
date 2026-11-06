@@ -12,6 +12,12 @@
 provider = "cuda"
 # GPU index if there is more than one adapter (virtual display adapters count too).
 device_id = 0
+# CUDA only: cap in MiB on each ONNX model's memory pool (bge-m3 and bge-reranker); 0 = no cap. Without a cap the
+# pool grows in power-of-two steps (each model jumped between 1.4 and 2.2 GB on an 8 GB card), which can push
+# other apps' VRAM into slow shared memory. With a cap a request that needs more fails with an "Available memory"
+# error: raise the cap or lower that model's batch_size / max_length. 1536 fits [embedding.gpu] batch_size <= 4 at
+# 2048 tokens and [rerank] batch_size <= 2 at 1024 tokens (tested on an RTX 4070 laptop GPU).
+onnx_memory_limit_mb = 1536
 
 [embedding]
 # Hugging Face repo that is downloaded on first run (its ONNX export is used).
@@ -26,7 +32,8 @@ port = 8081
 threads = 0
 # Weight quantization: "int8" (CPU only; on a GPU it is not applied and a warning is printed), "nf4" (CPU and
 # CUDA, 4-bit) or "none". Quantized files are built once by `start.bat setup`. Changing it changes the
-# vectors slightly: re-scrape libraries for best results.
+# vectors slightly: re-scrape libraries for best results. On CUDA, "int8" and "none" use a fused fp16 model
+# (built once by setup, about half the VRAM of fp32, same vectors; see README "Quantization").
 quantization = "int8"
 # Log every /v1/embeddings request.
 access_log = false
@@ -35,8 +42,10 @@ access_log = false
 #   batch_size = texts per ONNX forward pass (padded to the longest text in the batch).
 #   max_length = truncation limit in tokens (bge-m3 supports up to 8192); attention memory grows with its square.
 [embedding.cpu]
+# 8 texts at 8192 tokens would need ~34 GB of RAM for one layer's attention; 2048 truncates nothing docs-mcp-server
+# indexes (chunks are up to ~1300 tokens).
 batch_size = 8
-max_length = 8192
+max_length = 2048
 
 [embedding.gpu]
 # Larger values can overflow the GPU: Windows then silently moves GPU memory into system RAM and everything
@@ -65,8 +74,9 @@ quantization = "int8"
 # "auto" = follow `quantization`. Or name one file, which then ignores `quantization`:
 # onnx/model_int8.onnx, onnx/model_fp16.onnx, onnx/model.onnx (fp32, 2.3 GB).
 bge_onnx_file = "auto"
-# Pairs per ONNX forward pass (bge) and CPU threads (0 = automatic, as in [embedding]).
-batch_size = 8
+# Pairs per ONNX forward pass (bge) and CPU threads (0 = all physical cores).
+# 1 on an RTX 4070 laptop GPU: fastest (0.8 s vs 1.0 s per 30-candidate search at 8) and the least VRAM.
+batch_size = 1
 threads = 0
 access_log = false
 
@@ -127,7 +137,7 @@ access_log = false
 # Embeddings: BAAI/bge-code-v1 (Apache-2.0, 1.5B parameters) on PyTorch from a local endpoint (embed_port).
 # The next start installs cocoindex-code + PyTorch (CUDA build with [gpu] provider = "cuda") and downloads
 # the model (~6.2 GB). Indexes, clones and settings stay in runtime\data\code.
-enabled = true
+enabled = false
 host = "127.0.0.1"
 port = 6290
 embed_host = "127.0.0.1"
@@ -149,8 +159,11 @@ batch_size = 4
 max_length = 1024
 
 [code_search.gpu]
+# 8 is the int8 sweet spot (16 is 6% faster but needs ~1 GB more). cocoindex-code chunks are <= 1000 characters:
+# median 227 tokens, 99th percentile 469, 0.6% over 512, so 512 truncates almost nothing and caps the worst case
+# at ~2.7 GB instead of ~3.3 GB.
 batch_size = 8
-max_length = 1024
+max_length = 512
 
 [docs_mcp]
 package = "@arabold/docs-mcp-server"

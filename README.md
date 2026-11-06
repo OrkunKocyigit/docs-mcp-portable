@@ -128,12 +128,26 @@ runtime or device cannot do is **not applied**: the model loads normally and the
 | JEV-9B (PyTorch, CUDA) | yes | yes (its third choice is `"bf16"`) |
 
 - ONNX: onnxruntime runs int8 on NVIDIA GPUs only through TensorRT, so on CUDA/DirectML `int8` keeps the full model
-  (fp32 for bge-m3, the fp16 file for the reranker). `nf4` has no DirectML kernels. A repository's own
+  (the fp16 file for the reranker; for bge-m3 fp16 on CUDA, fp32 on DirectML). `nf4` has no DirectML kernels. A repository's own
   `model_int8.onnx` / `model_quantized.onnx` is used when it has one; otherwise `start.bat setup` builds
   `onnx/model.int8.onnx` or `onnx/model.nf4.onnx` from the fp32 model once (a few minutes, several GB of RAM).
   The vocabulary table stays in full precision under nf4, so XLM-R models shrink less than with int8.
 - Measured on bge-m3 against fp32 (cosine similarity of the vectors, CPU): int8 0.98 (2.3 GB -> 540 MB), nf4 0.97
   (-> 1.2 GB).
+- bge-m3 on CUDA (`"int8"` or `"none"`): bge-m3 ships no fp16 file, so `start.bat setup` builds
+  `onnx/model.fp16.onnx` once from the fp32 model (about 30 s). It fuses attention, SkipLayerNorm and Gelu into
+  onnxruntime's CUDA kernels; fused attention keeps memory linear in the text length instead of quadratic. Setup
+  prints how many attention layers were fused (24 for bge-m3). Vectors match fp32 (cosine >= 0.9999), so no
+  re-scrape is needed. Measured on an RTX 4070 laptop GPU (8 GB): peak VRAM of the embedding server (CUDA context
+  included) and time per batch of 2048-token texts:
+
+  | bge-m3 on CUDA | 2 texts per batch (default) | 8 texts per batch |
+  |---|---|---|
+  | fp32 (before) | 4.6-5.3 GB, 580 ms | 6.8-7.0 GB (the whole card), 3-4.4 s |
+  | fp16, fused | 2.1 GB, 100 ms | 2.1 GB, 460 ms |
+
+  The reranker's attention does not fuse (its export uses a pattern onnxruntime does not recognise), so it keeps
+  the repository's fp16 file.
 - Changing the embedding precision changes the vectors slightly. The launcher remembers the precision the docs index
   was built with and prints a one-time note to re-scrape when it changes; search keeps working meanwhile.
 - PyTorch int8 on the CPU uses `torch.ao.quantization`, which PyTorch has deprecated in favour of torchao but still
@@ -172,8 +186,9 @@ extra docs-mcp-server flags and environment variables such as `GITHUB_TOKEN`). N
   (measured: two onnxruntime servers using all cores ran 2.6x slower than one after the other with spinning on).
   With `threads = 0`, each server uses all physical cores, except when code search also runs on the CPU
   (`[code_search] enabled = true` and `[gpu] provider = "none"`): then bge-code-v1 gets half the cores and the
-  embedding/rerank servers the other half, so code indexing and docs search can run together. The launcher prints
-  the split; a `threads` value in `[embedding]`, `[rerank]` or `[code_search]` overrides it for that server.
+  embedding server the other half, so code indexing and docs scraping can run together. The reranker keeps all
+  cores: its short calls slow down far more on half of them (2.0 s -> 3.3 s per search measured). The launcher
+  prints the split; a `threads` value in `[embedding]`, `[rerank]` or `[code_search]` overrides it for that server.
 
 ### GPU
 
@@ -186,13 +201,19 @@ device_id = 0          # which GPU, if there are several
 ```
 
 The next `start.bat` swaps in the matching onnxruntime build (`[project.optional-dependencies]` in `pyproject.toml`)
-and, for bge, downloads the fp16 reranker instead of int8 (see [Quantization](#quantization)). The launcher prints where each
+and, for bge, downloads the fp16 reranker instead of int8; on CUDA it also builds a fused fp16 bge-m3 (see [Quantization](#quantization)). The launcher prints where each
 model runs (`cpu`, `cuda` or `directml`); if the GPU is not usable it says so and continues on the CPU.
 
 | provider | Package | Extra download | Notes |
 |---|---|---|---|
 | `cuda` | `onnxruntime-gpu[cuda,cudnn]` | ~2.5 GB (CUDA 13 + cuDNN 9 wheels) | NVIDIA only, recent driver. With `backend = "jina"` also the CUDA build of PyTorch 2.14.1 (~2 GB, pinned by URL + sha256). |
 | `directml` | `onnxruntime-directml` | ~25 MB | NVIDIA/AMD/Intel. DirectML is in maintenance mode (last release 1.24.4); jina stays on the CPU. |
+
+To leave VRAM for other apps (browser, IDE), set `[gpu] onnx_memory_limit_mb` (CUDA only, `0` = no cap). Without a
+cap, each ONNX model's memory pool grows in power-of-two steps; on an 8 GB card bge-m3 and the reranker each landed
+at 1.4 or 2.2 GB from one run to the next. Capping both at 1536 MiB kept all three GPU models (with code search) under
+6.7 GB at full load. A request that needs more than the cap fails with an "Available memory" error instead of
+spilling into shared memory; raise the cap or lower that model's `batch_size` / `max_length`.
 
 GPU builds are Windows x64 only. Switching back to `"none"` reinstalls the CPU build; the CUDA wheels stay in
 `runtime\python` until you delete that folder. Virtual display adapters (e.g. Android emulators) count as GPUs for

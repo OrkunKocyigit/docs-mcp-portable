@@ -25,7 +25,9 @@ class OnnxPlanTest(unittest.TestCase):
             ("int8", "none"): ("onnx/model.int8.onnx", "int8", "onnx/model.onnx", False),
             ("nf4", "none"): ("onnx/model.nf4.onnx", "nf4", "onnx/model.onnx", False),
             ("nf4", "cuda"): ("onnx/model.nf4.onnx", "nf4", "onnx/model.onnx", False),
-            ("int8", "cuda"): ("onnx/model.onnx", "fp32", None, True),
+            ("none", "cuda"): ("onnx/model.fp16.onnx", "fp16", "onnx/model.onnx", False),
+            ("int8", "cuda"): ("onnx/model.fp16.onnx", "fp16", "onnx/model.onnx", True),
+            ("none", "directml"): ("onnx/model.onnx", "fp32", None, False),
             ("int8", "directml"): ("onnx/model.onnx", "fp32", None, True),
             ("nf4", "directml"): ("onnx/model.onnx", "fp32", None, True),
         }
@@ -49,6 +51,34 @@ class OnnxPlanTest(unittest.TestCase):
         self.assertIn("not supported", gpu.warning)
         self.assertEqual(q.rerank_plan("none", "cuda", "auto", RERANK_REPO).file, "onnx/model_fp16.onnx")
         self.assertEqual(q.rerank_plan("none", "none", "auto", RERANK_REPO).file, "onnx/model.onnx")
+
+    def test_cuda_int8_fallback_builds_fp16_and_says_so(self):
+        plan = q.embedding_plan("int8", "cuda", {"onnx/model.onnx", "onnx/model.onnx_data"})
+        self.assertEqual(plan.build_level, "fp16")
+        self.assertIn("loading fp16", plan.warning)
+        self.assertEqual(q.download_patterns(plan, {"onnx/model.onnx", "onnx/model.onnx_data"}),
+                         ["onnx/model.onnx", "onnx/model.onnx_data"])
+
+    def test_shipped_fp16_file_is_never_rebuilt(self):
+        plan = q.rerank_plan("int8", "cuda", "auto", RERANK_REPO)
+        self.assertIsNone(plan.build_from)
+        self.assertEqual(q.download_patterns(plan, RERANK_REPO), ["onnx/model_fp16.onnx"])
+
+    def test_reranker_without_fp16_file_builds_it_on_cuda_only(self):
+        repo = {"onnx/model.onnx", "onnx/model.onnx_data"}
+        self.assertEqual(q.rerank_plan("none", "cuda", "auto", repo).file, "onnx/model.fp16.onnx")
+        self.assertEqual(q.rerank_plan("none", "directml", "auto", repo).file, "onnx/model.onnx")
+
+    def test_resolve_falls_back_to_fp32_until_fp16_is_built(self):
+        model_dir = Path(tempfile.mkdtemp())
+        (model_dir / "onnx").mkdir()
+        (model_dir / "onnx" / "model.onnx").write_bytes(b"x")
+        plan = q.embedding_plan("none", "cuda", q.local_onnx_files(model_dir))
+        with self.assertLogs(LOG, "WARNING"):
+            self.assertEqual(q.resolve_onnx(model_dir, plan, LOG)[1], "fp32")
+        (model_dir / "onnx" / "model.fp16.onnx").write_bytes(b"x")
+        path, precision = q.resolve_onnx(model_dir, plan, LOG)
+        self.assertEqual((path.name, precision), ("model.fp16.onnx", "fp16"))
 
     def test_reranker_nf4_is_built_not_taken_from_bnb4_file(self):
         plan = q.rerank_plan("nf4", "cuda", "auto", RERANK_REPO)
@@ -126,12 +156,67 @@ class BuildOnnxTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in folder.iterdir()),
                          ["model.int8.onnx", "model.nf4.onnx", "model.onnx"])  # no temp files left
 
+    def test_fp16_halves_weights_keeps_float32_io_and_stays_close(self):
+        import onnx
+        from onnx import TensorProto
+
+        folder = Path(tempfile.mkdtemp())
+        self.make_model(folder / "model.onnx")
+        base = self.infer(folder / "model.onnx")
+        note = q.build_onnx(folder / "model.onnx", folder / "model.fp16.onnx", "fp16")
+        self.assertIn("not fused", note)  # a toy graph has no attention to fuse
+        model = onnx.load(str(folder / "model.fp16.onnx"))
+        self.assertEqual({t.data_type for t in model.graph.initializer}, {TensorProto.FLOAT16})
+        self.assertEqual(model.graph.output[0].type.tensor_type.elem_type, TensorProto.FLOAT)
+        out = self.infer(folder / "model.fp16.onnx")
+        self.assertEqual(out.dtype, np.float32)
+        cos = float(out @ base / np.linalg.norm(out) / np.linalg.norm(base))
+        self.assertGreater(cos, 0.999)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["model.fp16.onnx", "model.onnx"])
+
+    def test_failed_build_leaves_no_partial_file(self):
+        folder = Path(tempfile.mkdtemp())
+        (folder / "model.onnx").write_bytes(b"not an onnx model")
+        with self.assertRaises(Exception):
+            q.build_onnx(folder / "model.onnx", folder / "model.fp16.onnx", "fp16")
+        self.assertEqual([p.name for p in folder.iterdir()], ["model.onnx"])
+
     def test_unknown_level_leaves_nothing(self):
         folder = Path(tempfile.mkdtemp())
         self.make_model(folder / "model.onnx")
         with self.assertRaises(ValueError):
             q.build_onnx(folder / "model.onnx", folder / "x.onnx", "fp8")
         self.assertEqual([p.name for p in folder.iterdir()], ["model.onnx"])
+
+
+BGE_M3_DIR = paths.model_dir("BAAI/bge-m3") / "onnx"
+
+
+@unittest.skipUnless(HAVE_ONNX and (BGE_M3_DIR / "model.onnx_data").exists(), "bge-m3 not downloaded")
+class BgeM3Fp16Test(unittest.TestCase):
+    """The real export must fuse every attention layer, or the CUDA build loses its memory saving."""
+
+    def test_all_24_attention_layers_fuse_and_vectors_match_fp32(self):
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        target = Path(tempfile.mkdtemp()) / "model.fp16.onnx"
+        self.assertEqual(q.build_onnx(BGE_M3_DIR / "model.onnx", target, "fp16"), "24 attention layers fused")
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
+        if "CUDAExecutionProvider" in providers and hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()  # as onnx_session.create_session does
+        tok = Tokenizer.from_file(str(BGE_M3_DIR / "tokenizer.json"))
+        ids = np.array([tok.encode("How do I configure the reranker on a GPU?").ids], dtype=np.int64)
+        feeds = {"input_ids": ids, "attention_mask": np.ones_like(ids)}
+        vectors = []
+        for path, prov in ((BGE_M3_DIR / "model.onnx", ["CPUExecutionProvider"]), (target, providers)):
+            try:
+                session = ort.InferenceSession(str(path), providers=prov)
+            except Exception as exc:  # fused fp16 Attention has no CPU kernel
+                self.skipTest(f"cannot run the fp16 model here: {str(exc)[:100]}")
+            vectors.append(np.asarray(session.run(["sentence_embedding"], feeds)[0], dtype=np.float32).ravel())
+        a, b = vectors
+        self.assertGreater(float(a @ b / np.linalg.norm(a) / np.linalg.norm(b)), 0.9999)
 
 
 class TorchPlanTest(unittest.TestCase):
@@ -205,6 +290,14 @@ class EmbeddingPrecisionMarkerTest(unittest.TestCase):
         with mock.patch("sys.stderr"):
             self.assertIn("re-scrape", launcher.note_embedding_precision("bge-m3", "int8"))
             self.assertIsNone(launcher.note_embedding_precision("bge-m3", "int8"))  # only once
+
+    def test_fp16_counts_as_fp32_so_no_rescrape_note(self):
+        (self.store / "documents.db").write_bytes(b"")
+        self.assertIsNone(launcher.note_embedding_precision("bge-m3", "fp16"))
+        self.assertIsNone(launcher.note_embedding_precision("bge-m3", "fp32"))
+        with mock.patch("sys.stderr"):
+            self.assertIsNotNone(launcher.note_embedding_precision("bge-m3", "int8"))
+            self.assertIsNotNone(launcher.note_embedding_precision("bge-m3", "fp16"))  # int8 -> fp16 does change
 
     def test_unchanged_precision_is_silent(self):
         (self.store / "documents.db").write_bytes(b"")

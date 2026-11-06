@@ -212,8 +212,11 @@ def ensure_model(cfg: Config) -> Path:
 def _build_quantized(model_dir: Path, plan: quantization.OnnxPlan, label: str) -> None:
     if not plan.build_from or (model_dir / plan.file).exists():
         return
-    say(f"Quantizing {label} to {plan.build_level} (one-time, a few minutes and several GB of RAM)")
-    quantization.build_onnx(model_dir / plan.build_from, model_dir / plan.file, plan.build_level)
+    action = "Converting" if plan.build_level == "fp16" else "Quantizing"
+    say(f"{action} {label} to {plan.build_level} (one-time, a few minutes and several GB of RAM)")
+    note = quantization.build_onnx(model_dir / plan.build_from, model_dir / plan.file, plan.build_level)
+    if note:
+        say(f"{label} {plan.build_level}: {note}")
 
 
 def _repo_files(repo: str, revision: str) -> set[str]:

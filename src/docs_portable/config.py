@@ -24,6 +24,9 @@ class GpuConfig:
     provider: str = "none"
     # GPU index when the machine has more than one adapter.
     device_id: int = 0
+    # CUDA only: cap in MiB on each ONNX model's memory pool (bge-m3, bge-reranker); 0 = no cap. Without one the
+    # pool grows in power-of-two steps (+768 MiB jumps measured); a request that needs more than the cap fails.
+    onnx_memory_limit_mb: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -32,7 +35,10 @@ class GpuConfig:
     def onnx_providers(self) -> list:
         """onnxruntime execution providers in order of preference, CPU always last."""
         name = {"cuda": "CUDAExecutionProvider", "directml": "DmlExecutionProvider"}.get(self.provider)
-        gpu = [(name, {"device_id": self.device_id})] if name else []
+        options: dict = {"device_id": self.device_id}
+        if self.provider == "cuda" and self.onnx_memory_limit_mb:
+            options["gpu_mem_limit"] = self.onnx_memory_limit_mb * 2**20
+        gpu = [(name, options)] if name else []
         return [*gpu, "CPUExecutionProvider"]
 
     def validate(self) -> None:
@@ -40,6 +46,9 @@ class GpuConfig:
             raise ValueError(f"config.toml: [gpu] provider must be one of {', '.join(GPU_PROVIDERS)}")
         if isinstance(self.device_id, bool) or not isinstance(self.device_id, int) or not 0 <= self.device_id <= 64:
             raise ValueError("config.toml: [gpu] device_id must be an integer between 0 and 64")
+        limit = self.onnx_memory_limit_mb
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (limit == 0 or 512 <= limit <= 262144):
+            raise ValueError("config.toml: [gpu] onnx_memory_limit_mb must be 0 (no cap) or between 512 and 262144")
 
 
 EMBEDDING_LIMIT_KEYS = ("batch_size", "max_length")
@@ -67,7 +76,9 @@ class EmbeddingConfig:
     model_name: str = "bge-m3"
     host: str = "127.0.0.1"
     port: int = 8081
-    cpu: EmbeddingLimits = field(default_factory=lambda: EmbeddingLimits(batch_size=8, max_length=8192))
+    # CPU: 8 texts of 8192 tokens would need ~34 GB for one layer's attention scores; 2048 truncates nothing
+    # docs-mcp-server indexes (chunks are up to ~1300 tokens).
+    cpu: EmbeddingLimits = field(default_factory=lambda: EmbeddingLimits(batch_size=8, max_length=2048))
     # GPU: 8 texts of up to 8192 tokens overflowed an 8 GB card into shared system memory (Windows does not report
     # out-of-memory, it just gets many times slower). docs-mcp-server chunks are up to ~1300 tokens.
     gpu: EmbeddingLimits = field(default_factory=lambda: EmbeddingLimits(batch_size=2, max_length=2048))

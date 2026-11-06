@@ -127,7 +127,8 @@ def _smoke_test(cfg: Config) -> None:
 
 def note_embedding_precision(model_name: str, precision: str) -> str | None:
     """Warn once when the docs index was built with other embedding weights (vectors differ slightly)."""
-    current = f"{model_name}:{precision}"
+    # fp16 vectors match fp32 (cosine >= 0.9999 measured on bge-m3), so switching between them needs no re-scrape.
+    current = f"{model_name}:{'fp32' if precision == 'fp16' else precision}"
     marker = paths.STORE_DIR / "embedding-precision.txt"
     if marker.exists():
         previous = marker.read_text(encoding="utf-8").strip()
@@ -205,9 +206,10 @@ def cpu_sharing_note(cfg: Config) -> str | None:
     if not cpu.shares_cpu(cfg):
         return None
     plan = cpu.thread_plan(cfg)
-    return (f"[run] CPU shared by docs search and code search: {plan['embedding']} threads for embedding/rerank, "
-            f"{plan['code']} for {cfg.code_search.model_name} ({cpu.physical_cores()} physical cores; "
-            "set threads in config.toml to override)")
+    rerank = f"{plan['rerank']}" if plan["rerank"] else "all"
+    return (f"[run] CPU shared by docs search and code search: {plan['embedding']} threads for embedding, "
+            f"{plan['code']} for {cfg.code_search.model_name}, {rerank} for rerank ({cpu.physical_cores()} physical "
+            "cores; set threads in config.toml to override)")
 
 
 def _rerank_device(cfg: Config) -> str:
