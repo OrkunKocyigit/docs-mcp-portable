@@ -117,14 +117,32 @@ def ensure_dependencies() -> None:
     marker.write_text(digest)
 
 
+def run_app(cmd: list[str], env: dict[str, str]) -> int:
+    """Run docs_portable and return its exit code.
+
+    Ctrl+C reaches every process in the console, the launcher included, and the launcher then stops its servers.
+    So keep waiting for it: killing it here (as subprocess.call does) would cut that shutdown short.
+    """
+    proc = subprocess.Popen(cmd, env=env)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
+
+
 def main() -> int:
     if sys.version_info[:2] != (3, 12):
         raise SystemExit(f"Python 3.12 is required, found {sys.version.split()[0]}")
     patch_pth()
-    ensure_dependencies()
+    try:
+        ensure_dependencies()
+    except KeyboardInterrupt:
+        say("Interrupted.")
+        return 130
     env = os.environ.copy()
     env["DOCS_PORTABLE_HOME"] = str(ROOT)
-    return subprocess.call([sys.executable, "-X", "utf8", "-m", "docs_portable", *sys.argv[1:]], env=env)
+    return run_app([sys.executable, "-X", "utf8", "-m", "docs_portable", *sys.argv[1:]], env)
 
 
 if __name__ == "__main__":

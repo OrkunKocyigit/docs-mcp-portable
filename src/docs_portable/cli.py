@@ -8,6 +8,14 @@ from .config import load_config
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:  # e.g. Ctrl+C during setup; the launcher handles it itself once servers run
+        print("\n[run] Interrupted.", flush=True)
+        return 130
+
+
+def _main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(
         prog="docs-portable",
         description="docs-mcp-server with a local BGE-M3 OpenAI-compatible embedding endpoint.",

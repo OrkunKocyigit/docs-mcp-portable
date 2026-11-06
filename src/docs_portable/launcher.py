@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from .config import Config
 from .jev_protocol import TOKEN_ENV as JEV_TOKEN_ENV
 
 HEALTH_TIMEOUT_S = 300
+SHUTDOWN_GRACE_S = 10  # after Ctrl+C, time the servers get to exit on their own before they are stopped
 JEV_LOAD_TIMEOUT_S = 1800  # 18 GB from disk plus quantization on load
 JEV_MCP_STRIP_PREFIXES = ("JEV_", "TYPESAFE_", "OPENROUTER_", "CLOUDFLARE_", "AI_GATEWAY_")
 RERANK_ENV = (
@@ -109,6 +111,26 @@ def _stop(proc: subprocess.Popen | None) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+def _shutdown_after_ctrl_c(procs: list[subprocess.Popen | None], grace_s: float = SHUTDOWN_GRACE_S) -> int:
+    """The servers share the console, so they received the same Ctrl+C: let them exit on their own, then stop
+    whatever is still running. Returns how many had to be stopped."""
+    running = [p for p in procs if p is not None]
+    deadline = time.monotonic() + grace_s
+    while any(p.poll() is None for p in running) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    forced = [p for p in running if p.poll() is None]
+    for proc in forced:
+        _stop(proc)
+    return len(forced)
+
+
+def shutdown_message(forced: int) -> str:
+    if not forced:
+        return "[run] \u2713 Graceful shutdown completed."
+    return (f"[run] \u2713 Shutdown completed ({forced} server{'s' if forced > 1 else ''} did not stop within "
+            f"{SHUTDOWN_GRACE_S} s and {'were' if forced > 1 else 'was'} stopped).")
 
 
 def _smoke_test(cfg: Config) -> None:
@@ -342,6 +364,7 @@ def run(cfg: Config) -> int:
     code_embed: subprocess.Popen | None = None
     code_page: subprocess.Popen | None = None
     jev_token = secrets.token_urlsafe(32)
+    interrupted = False
     try:
         note = cpu_sharing_note(cfg)
         if note:
@@ -429,16 +452,21 @@ def run(cfg: Config) -> int:
                     jev_server = jev_mcp = None
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\n[run] Stopping...", flush=True)
+        interrupted = True
+        print("\n[run] Ctrl+C received; stopping the servers...", flush=True)
         return 0
     except RuntimeError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 1
     finally:
-        _stop(code_page)
-        _stop(code_embed)
-        _stop(jev_mcp)
-        _stop(jev_server)
-        _stop(server)
-        _stop(rerank)
-        _stop(embed)
+        # A second Ctrl+C must not cut the shutdown short (or print a traceback); every wait below is bounded.
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            procs = [code_page, code_embed, jev_mcp, jev_server, server, rerank, embed]
+            if interrupted:
+                print(shutdown_message(_shutdown_after_ctrl_c(procs)), flush=True)
+            else:
+                for proc in procs:
+                    _stop(proc)
+        finally:
+            signal.signal(signal.SIGINT, previous)
